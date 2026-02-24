@@ -1,5 +1,6 @@
 # Cloud Build trigger config (2nd gen). Use if CLI flags fail with INVALID_ARGUMENT.
 # Create: gcloud builds triggers create github --trigger-config=trigger.yaml --region=asia-southeast1 --project=odoo-ocr-487104
+# Use default Compute Engine SA; do not use 727082425075@cloudbuild.gserviceaccount.com (invalid).
 name: ap-bill-ocr-worker-deploy
 description: Deploy ap-bill-ocr-worker to Cloud Run on push
 repositoryEventConfig:
@@ -7,4 +8,4 @@ repositoryEventConfig:
   push:
     branch: ^master$
 filename: cloudbuild.yaml
-serviceAccount: projects/odoo-ocr-487104/serviceAccounts/727082425075@cloudbuild.gserviceaccount.com
+serviceAccount: projects/odoo-ocr-487104/serviceAccounts/727082425075-compute@developer.gserviceaccount.com
