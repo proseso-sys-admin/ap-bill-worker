@@ -26,6 +26,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/", (_req, res) => {
+  // When adding a new route (e.g. /collect-feedback, webhooks), add it here so GET / lists all available endpoints.
   res.status(200).json({ ok: true, service: "ap-bill-ocr-worker", routes: ["/health", "/healthz", "/run", "/run-one", "/list-docs", "/debug"] });
 });
 
