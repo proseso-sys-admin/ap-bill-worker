@@ -1797,9 +1797,8 @@ async function linkDocumentToBill(odoo, companyId, docId, billId, logger, active
   const linkVals = {};
   if (await documentsDocumentHasField(odoo, "res_model")) linkVals.res_model = "account.move";
   if (await documentsDocumentHasField(odoo, "res_id")) linkVals.res_id = Number(billId);
-  // Intentionally NOT setting account_move_id / invoice_id — those Many2one FKs
-  // may use ondelete="cascade", causing Odoo to delete the document when the bill
-  // is deleted. res_model + res_id is the standard safe link.
+  if (await documentsDocumentHasField(odoo, "account_move_id")) linkVals.account_move_id = Number(billId);
+  if (await documentsDocumentHasField(odoo, "invoice_id")) linkVals.invoice_id = Number(billId);
   if (originalFolderId) linkVals.folder_id = originalFolderId;
 
   if (Object.keys(linkVals).length) {
@@ -2732,6 +2731,14 @@ async function handleDocumentDelete(logger, payload = {}) {
   }
   if (String(move.state || "").toLowerCase() !== "draft") {
     return { ok: false, error: "bill_not_draft", message: "Document is linked to a posted bill; delete or unlink in Odoo first." };
+  }
+  try {
+    const clearVals = { res_model: false, res_id: false };
+    if (await documentsDocumentHasField(odoo, "account_move_id")) clearVals.account_move_id = false;
+    if (await documentsDocumentHasField(odoo, "invoice_id")) clearVals.invoice_id = false;
+    await odoo.write("documents.document", [Number(docId)], clearVals);
+  } catch (_) {
+    // Document may already be gone; safe to ignore
   }
   await odoo.executeKw("account.move", "unlink", [[entry.bill_id]], {});
   await removeDocBillEntry(config, docId);
