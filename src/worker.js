@@ -207,64 +207,101 @@ async function pickVatTaxesForCompany(odoo, companyId) {
         ["active", "=", true],
         ["type_tax_use", "in", ["purchase", "none"]]
       ],
-      ["id", "name", "amount", "amount_type", "type_tax_use", "price_include", "description", "tax_group_id"],
+      ["id", "name", "amount", "amount_type", "type_tax_use", "price_include", "description", "tax_group_id", "tax_scope"],
       kwWithCompany(companyId, { limit: 2000, order: "name asc" })
     )) || [];
 
   const norm = (s) => String(s || "").toLowerCase();
-  const has = (t, re) => re.test(`${norm(t.name)} ${norm(t.description)} ${Array.isArray(t.tax_group_id) ? norm(t.tax_group_id[1]) : ""}`);
+  const text = (t) => `${norm(t.name)} ${norm(t.description)} ${Array.isArray(t.tax_group_id) ? norm(t.tax_group_id[1]) : ""}`;
+  const has = (t, re) => re.test(text(t));
+  const scope = (t) => norm(t.tax_scope || "");
+
   const isWithholding = (t) => has(t, /fwvat|ewvat|withhold|withholding|wht|designated|ds\b/);
+  const isCapital = (t) => has(t, /capital\s*goods|capital\s*asset|\bcapital\b.*\bgoods\b|\b12%\s*c\b|\b12%c\b/);
   const isImport = (t) => has(t, /\bimport\b|\bimportation\b|\b12%\s*i\b/);
-  const isNcr = (t) => has(t, /\bncr\b|non[-\s]?credit/);
+  const isNcr = (t) => has(t, /\bncr\b|non[-\s]?credit|not directly attribut/);
+  const isNonResident = (t) => has(t, /non[-\s]?resident|\bnr\b|\bs\s*nr\b/);
+  const isExempt = (t) => has(t, /exempt/);
+  const isZeroRated = (t) => has(t, /zero[-\s]?rat/);
+  const serviceLike = (t) => (scope(t) === "service" || has(t, /service|consult|professional|repair|rent|labor|contract|freight/)) && !isCapital(t) && !isNonResident(t);
+  const goodsLike = (t) => (scope(t) === "consu" || scope(t) === "goods" || has(t, /goods|supply|material|inventory|product|merch/)) && !isCapital(t) && !isImport(t);
 
-  const vat12 = taxes.filter((t) => {
-    const amount = Number(t.amount || 0);
-    return (
-      t.amount_type === "percent" &&
-      Math.abs(amount - 12) < 0.0001 &&
-      !isWithholding(t) &&
-      !isImport(t) &&
-      !isNcr(t)
-    );
+  const pct12 = taxes.filter((t) => t.amount_type === "percent" && Math.abs(Number(t.amount || 0) - 12) < 0.01 && !isWithholding(t));
+  const pct0 = taxes.filter((t) => t.amount_type === "percent" && Math.abs(Number(t.amount || 0)) < 0.01 && !isWithholding(t));
+
+  const pick = (arr, scorer) => pickTopTaxByScore(arr, scorer);
+
+  const goods = pick(pct12.filter((t) => !isCapital(t) && !isImport(t) && !isNcr(t) && !isNonResident(t)), (t) => {
+    let s = 0;
+    if (goodsLike(t)) s += 10;
+    if (!serviceLike(t) && !isExempt(t)) s += 3;
+    if (!t.price_include) s += 1;
+    return s;
+  });
+  const services = pick(pct12.filter((t) => !isCapital(t) && !isImport(t) && !isNcr(t) && !isNonResident(t)), (t) => {
+    let s = 0;
+    if (serviceLike(t)) s += 10;
+    if (!goodsLike(t) && !isExempt(t)) s += 3;
+    if (!t.price_include) s += 1;
+    return s;
+  });
+  const capital = pick(pct12.filter((t) => isCapital(t)), (t) => {
+    let s = 5;
+    if (!t.price_include) s += 1;
+    return s;
+  });
+  const imports = pick(pct12.filter((t) => isImport(t) && !isExempt(t)), (t) => {
+    let s = 5;
+    if (!t.price_include) s += 1;
+    return s;
+  });
+  const nonResident = pick(pct12.filter((t) => isNonResident(t)), (t) => {
+    let s = 5;
+    if (!t.price_include) s += 1;
+    return s;
+  });
+  const ncr = pick(pct12.filter((t) => isNcr(t)), (t) => {
+    let s = 5;
+    if (!t.price_include) s += 1;
+    return s;
+  });
+  const exempt = pick(pct0.filter((t) => isExempt(t) && !isImport(t)), (t) => {
+    let s = 5;
+    if (norm(t.type_tax_use) === "purchase") s += 2;
+    return s;
+  });
+  const exemptImports = pick(pct0.filter((t) => isExempt(t) && isImport(t)), (t) => {
+    let s = 5;
+    return s;
+  });
+  const zeroRated = pick(pct0.filter((t) => isZeroRated(t) && !isExempt(t)), (t) => {
+    let s = 5;
+    if (norm(t.type_tax_use) === "purchase") s += 2;
+    return s;
+  });
+  const generic = goods || services || pick(pct12.filter((t) => !isWithholding(t) && !isNcr(t)), (t) => {
+    let s = 0;
+    if (norm(t.type_tax_use) === "purchase") s += 5;
+    if (!t.price_include) s += 2;
+    return s;
   });
 
-  if (!vat12.length) {
-    return { goodsId: null, servicesId: null, genericId: null };
-  }
-
-  const isCapitalGoods = (t) => has(t, /capital\s*goods|capital\s*asset|\bcapital\b.*\bgoods\b|\b12%\s*c\b|\b12%c\b/);
-  const serviceLike = (t) => has(t, /service|consult|professional|repair|rent|labor|contract|freight/) && !isCapitalGoods(t);
-  const goodsLike = (t) => has(t, /goods|supply|material|inventory|product|merch/) && !isCapitalGoods(t);
-
-  const generic = pickTopTaxByScore(vat12, (t) => {
-    let score = 0;
-    if (isCapitalGoods(t)) return -100;
-    if (norm(t.type_tax_use) === "purchase") score += 5;
-    if (!t.price_include) score += 2;
-    if (serviceLike(t) || goodsLike(t)) score += 1;
-    return score;
-  });
-  const services = pickTopTaxByScore(vat12, (t) => {
-    let score = 0;
-    if (isCapitalGoods(t)) return -100;
-    if (serviceLike(t)) score += 10;
-    if (!goodsLike(t)) score += 2;
-    if (!t.price_include) score += 1;
-    return score;
-  });
-  const goods = pickTopTaxByScore(vat12, (t) => {
-    let score = 0;
-    if (isCapitalGoods(t)) return -100;
-    if (goodsLike(t)) score += 10;
-    if (!serviceLike(t)) score += 2;
-    if (!t.price_include) score += 1;
-    return score;
-  });
-
+  const id = (t) => (t ? Number(t.id) : 0);
   return {
-    goodsId: Number(goods?.id || generic?.id || 0) || null,
-    servicesId: Number(services?.id || generic?.id || 0) || null,
-    genericId: Number(generic?.id || 0) || null
+    goodsId: id(goods) || id(generic),
+    servicesId: id(services) || id(generic),
+    capitalId: id(capital),
+    importsId: id(imports),
+    nonResidentId: id(nonResident),
+    ncrId: id(ncr),
+    exemptId: id(exempt),
+    exemptImportsId: id(exemptImports),
+    zeroRatedId: id(zeroRated),
+    genericId: id(generic),
+    _meta: {
+      priceInclude: !!(generic || goods || services)?.price_include,
+      amount: Number((generic || goods || services)?.amount || 12)
+    }
   };
 }
 
@@ -887,24 +924,55 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
   };
 }
 
-function pickTaxIds(vatIds, extracted) {
+function pickBillLevelTaxIds(taxMap, extracted) {
   const classification = String(extracted?.vat?.classification || "").toLowerCase();
   const lineItems = extracted?.line_items || [];
-  const anyLineVatable = lineItems.some(
-    (li) => String(li.vat_code || "").toLowerCase() === "vatable"
-  );
+  const anyLineVatable = lineItems.some((li) => String(li.vat_code || "").toLowerCase() === "vatable");
 
-  if (
-    !anyLineVatable &&
-    (classification === "exempt" || classification === "zero_rated" || classification === "unknown")
-  ) {
+  if (!anyLineVatable && (classification === "exempt" || classification === "zero_rated" || classification === "unknown")) {
+    if (classification === "exempt" && taxMap.exemptId) return [taxMap.exemptId];
+    if (classification === "zero_rated" && taxMap.zeroRatedId) return [taxMap.zeroRatedId];
     return [];
   }
   const gs = String(extracted?.vat?.goods_or_services || "").toLowerCase();
-  if (gs === "services" && Number(vatIds.services)) return [Number(vatIds.services)];
-  if (gs === "goods" && Number(vatIds.goods)) return [Number(vatIds.goods)];
-  const generic = Number(vatIds.generic) || 0;
-  return generic ? [generic] : [];
+  if (gs === "services" && taxMap.servicesId) return [taxMap.servicesId];
+  if (gs === "goods" && taxMap.goodsId) return [taxMap.goodsId];
+  return taxMap.genericId ? [taxMap.genericId] : [];
+}
+
+function pickLineTaxIds(taxMap, lineItem, billGoodsOrServices, vendorCountry) {
+  const vatCode = String(lineItem.vat_code || "").toLowerCase();
+  const gs = String(lineItem.goods_or_services || billGoodsOrServices || "").toLowerCase();
+  const isCapital = !!(lineItem.is_capital_goods);
+  const isImported = !!(lineItem.is_imported);
+  const cat = String(lineItem.expense_category || "").toLowerCase();
+
+  if (vatCode === "exempt") {
+    if (isImported && taxMap.exemptImportsId) return [taxMap.exemptImportsId];
+    return taxMap.exemptId ? [taxMap.exemptId] : [];
+  }
+  if (vatCode === "zero_rated") return taxMap.zeroRatedId ? [taxMap.zeroRatedId] : [];
+  if (vatCode === "no_vat") return [];
+  if (vatCode !== "vatable") return [];
+
+  if (isCapital && taxMap.capitalId) return [taxMap.capitalId];
+
+  const capitalCats = /equipment|machinery|vehicle|furniture|fixture|ppe|capital|computer\b|laptop|server/i;
+  if (capitalCats.test(cat) && taxMap.capitalId) return [taxMap.capitalId];
+
+  if (isImported && taxMap.importsId) return [taxMap.importsId];
+
+  const foreignCountry = String(vendorCountry || "").toLowerCase();
+  const isPH = !foreignCountry || /philipp|^ph$/i.test(foreignCountry);
+
+  if (!isPH && gs === "services" && taxMap.nonResidentId) return [taxMap.nonResidentId];
+
+  if (gs === "services" && taxMap.servicesId) return [taxMap.servicesId];
+  if (gs === "goods" && taxMap.goodsId) return [taxMap.goodsId];
+  if (cat && /professional_fees|rent|repairs|freight|utilities/.test(cat) && taxMap.servicesId) return [taxMap.servicesId];
+  if (cat && /office_supplies|inventory|fuel|meals/.test(cat) && taxMap.goodsId) return [taxMap.goodsId];
+
+  return taxMap.genericId ? [taxMap.genericId] : [];
 }
 
 async function getTaxMeta(odoo, companyId, taxIds) {
@@ -1571,17 +1639,18 @@ function vendorNameAccountHint(vendorName, expenseAccounts) {
   return 0;
 }
 
-function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId, currencyId, taxMeta, lineAccountIds) {
+function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, purchaseJournalId, currencyId, taxMeta, lineAccountIds, vendorCountry) {
   const inv = extracted?.invoice || {};
   const totals = extracted?.totals || {};
   const grandTotal = Number(totals.grand_total || 0);
   const netTotal = Number(totals.net_total || 0);
   const globalVatInclusive = !!totals.amounts_are_vat_inclusive;
-  const hasTax = taxIds.length > 0;
+  const hasBillTax = billLevelTaxIds.length > 0;
   const taxPriceInclude = !!taxMeta?.priceInclude;
   const taxRate = Number(taxMeta?.amount || 12);
+  const billGs = String(extracted?.vat?.goods_or_services || "").toLowerCase();
 
-  const usedNetTotal = hasTax && globalVatInclusive && !taxPriceInclude && netTotal > 0;
+  const usedNetTotal = hasBillTax && globalVatInclusive && !taxPriceInclude && netTotal > 0;
   const total = usedNetTotal ? netTotal : (grandTotal || netTotal || 0);
   const invoiceDate = String(inv.date || "").slice(0, 10) || undefined;
   const ref = String(inv.number || "").trim();
@@ -1591,7 +1660,7 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
   const hint = extracted?.expense_account_hint || {};
   const invoiceLines = [];
 
-  const expectedUntaxed = hasTax && !taxPriceInclude && grandTotal > 0
+  const expectedUntaxed = hasBillTax && !taxPriceInclude && grandTotal > 0
     ? (netTotal > 0 ? netTotal : Math.round((grandTotal / (1 + taxRate / 100)) * 100) / 100)
     : (grandTotal || netTotal || 0);
 
@@ -1602,12 +1671,13 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
       const item = lineItems[i];
       const lineVatCode = String(item.vat_code || "").toLowerCase();
 
-      let lineHasTax;
+      let lineTaxIds;
       if (hasPerLineVat && lineVatCode) {
-        lineHasTax = lineVatCode === "vatable" && taxIds.length > 0;
+        lineTaxIds = pickLineTaxIds(taxMap, item, billGs, vendorCountry);
       } else {
-        lineHasTax = hasTax;
+        lineTaxIds = billLevelTaxIds;
       }
+      const lineHasTax = lineTaxIds.length > 0 && lineVatCode !== "no_vat";
 
       const itemVatInclusive = lineHasTax && (globalVatInclusive || (item.unit_price_includes_vat ?? false));
       const discount = Number(item.discount_percent || 0);
@@ -1620,7 +1690,7 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
       if (discount > 0 && discount < 100) line.discount = discount;
       const acctId = lineAccountIds?.[i] || 0;
       if (acctId) line.account_id = acctId;
-      if (lineHasTax) line.tax_ids = [[6, 0, taxIds]];
+      if (lineTaxIds.length) line.tax_ids = [[6, 0, lineTaxIds]];
       invoiceLines.push([0, 0, line]);
     }
 
@@ -1654,7 +1724,7 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
     }
   } else {
     const singleLineVatInclusive = usedNetTotal ? false : globalVatInclusive;
-    const adjustedTotal = hasTax ? adjustPriceForTax(total, singleLineVatInclusive, taxPriceInclude, taxRate) : total;
+    const adjustedTotal = hasBillTax ? adjustPriceForTax(total, singleLineVatInclusive, taxPriceInclude, taxRate) : total;
     const finalTotal = expectedUntaxed > 0 ? expectedUntaxed : adjustedTotal;
     const lineDescs = lineItems
       .map((li) => String(li.description || "").trim())
@@ -1669,7 +1739,7 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
     };
     const acctId = lineAccountIds?.[0] || 0;
     if (acctId) line.account_id = acctId;
-    if (hasTax) line.tax_ids = [[6, 0, taxIds]];
+    if (billLevelTaxIds.length) line.tax_ids = [[6, 0, billLevelTaxIds]];
     invoiceLines.push([0, 0, line]);
   }
 
@@ -2023,8 +2093,9 @@ async function processOneDocument(args) {
 
   const currencyCode = String(extracted?.invoice?.currency || "").trim();
   const currencyId = await resolveCurrencyId(odoo, companyId, currencyCode);
-  const taxIds = pickTaxIds(resolvedVatIds, extracted);
-  const taxMeta = await getTaxMeta(odoo, companyId, taxIds);
+  const taxMap = resolvedVatIds;
+  const billLevelTaxIds = pickBillLevelTaxIds(taxMap, extracted);
+  const taxMeta = billLevelTaxIds.length ? await getTaxMeta(odoo, companyId, billLevelTaxIds) : taxMap._meta;
 
   // --- Vendor research (Google Search grounding) ---
   let vendorResearch = null;
@@ -2120,15 +2191,18 @@ async function processOneDocument(args) {
     });
   }
 
+  const vendorCountry = String(extracted?.vendor_details?.address || "").trim();
   const billVals = buildBillVals(
     extracted,
     vendor.id,
     companyId,
-    taxIds,
+    taxMap,
+    billLevelTaxIds,
     purchaseJournalId,
     currencyId,
     taxMeta,
-    lineAccountIds
+    lineAccountIds,
+    vendorCountry
   );
   const billId = await odoo.create("account.move", billVals);
   await persistDocBillMapping(config, doc.id, billId, targetKey);
@@ -2277,12 +2351,7 @@ async function processTargetGroup(target, startMs, logger) {
   const odoo = new OdooClient(target.targetCfg);
   const state = await loadState(config, target.targetKey);
 
-  const vatPick = await pickVatTaxesForCompany(odoo, target.companyId);
-  const resolvedVatIds = {
-    goods: vatPick.goodsId || 0,
-    services: vatPick.servicesId || 0,
-    generic: vatPick.genericId || 0
-  };
+  const resolvedVatIds = await pickVatTaxesForCompany(odoo, target.companyId);
 
   let apFolderId = Number(target.apFolderId || 0);
   let useIsFolder = false;
@@ -2447,12 +2516,7 @@ async function runOne({ logger, payload = {} }) {
     }
   }
 
-  const vatPick = await pickVatTaxesForCompany(odoo, companyId);
-  const resolvedVatIds = {
-    goods: vatPick.goodsId || 0,
-    services: vatPick.servicesId || 0,
-    generic: vatPick.genericId || 0
-  };
+  const resolvedVatIds = await pickVatTaxesForCompany(odoo, companyId);
 
   let runOneApFolderId = Number(target.apFolderId || 0);
   let runOneUseIsFolder = false;

@@ -183,10 +183,13 @@ const extractionSchema = {
           amount: { type: "number" },
           unit_price_includes_vat: { type: "boolean", description: "true if the unit_price shown on the invoice already includes VAT" },
           discount_percent: { type: "number", description: "Discount percentage applied to this line (0-100). 0 if no discount. E.g. 5 means 5% discount, so net = unit_price * qty * (1 - 5/100)" },
-          expense_category: { type: "string", description: "office_supplies|meals|repairs|rent|fuel|professional_fees|freight|utilities|inventory|other" },
+          expense_category: { type: "string", description: "office_supplies|meals|repairs|rent|fuel|professional_fees|freight|utilities|inventory|equipment|other" },
+          goods_or_services: { type: "string", description: "Per-line: goods|services|unknown. 'goods' for physical items/supplies/inventory. 'services' for labor/consulting/professional fees/rent/repairs/subscriptions/SaaS." },
+          is_capital_goods: { type: "boolean", description: "true if this line is a capital asset/equipment purchase (machinery, vehicles, computers, furniture, fixtures, PPE/property-plant-equipment). false for consumable supplies." },
+          is_imported: { type: "boolean", description: "true if this line item is clearly imported from abroad (foreign supplier, customs duties mentioned, import documentation). false if domestic or unclear." },
           vat_code: { type: "string", description: "Per-line VAT treatment: vatable|exempt|zero_rated|no_vat. Use 'no_vat' when the line explicitly says NO VAT or is non-vatable. Use 'vatable' when VAT applies." }
         },
-        required: ["description", "quantity", "unit_price", "amount", "discount_percent", "unit_price_includes_vat", "expense_category", "vat_code"]
+        required: ["description", "quantity", "unit_price", "amount", "discount_percent", "unit_price_includes_vat", "expense_category", "goods_or_services", "is_capital_goods", "is_imported", "vat_code"]
       }
     },
     warnings: { type: "array", items: { type: "string" } }
@@ -300,6 +303,33 @@ PER-LINE VAT (CRITICAL — different lines may have different VAT treatment):
 - "zero_rated" means the line is zero-rated.
 - IMPORTANT: An invoice can have MIXED VAT treatment. For example, a reimbursement line with NO VAT and a service fee line WITH 12% VAT. Each line must have its own vat_code.
 - Do NOT assume all lines have the same VAT treatment. Read the taxes column for each line carefully.
+
+PER-LINE GOODS vs SERVICES (CRITICAL for correct PH tax scope):
+- For EACH line_item, set goods_or_services:
+  - "goods" for physical products, supplies, inventory, raw materials, fuel, food items
+  - "services" for labor, consulting, professional fees, rent, repairs, maintenance, subscriptions, SaaS, software licenses, outsourced work, payroll processing
+  - "unknown" if genuinely unclear
+- Use the vendor type and line description as context. A consulting firm's invoice = services. A hardware store receipt = goods.
+
+PER-LINE CAPITAL GOODS DETECTION:
+- Set is_capital_goods = true ONLY for purchases of long-lived assets:
+  - Machinery, vehicles, computers, laptops, servers, furniture, fixtures, buildings, land improvements
+  - Equipment with useful life > 1 year and significant cost
+- Set is_capital_goods = false for:
+  - Consumable supplies (paper, ink, cleaning supplies)
+  - Inventory for resale
+  - Regular services
+  - Low-value items (office supplies, small tools)
+
+PER-LINE IMPORT DETECTION:
+- Set is_imported = true when:
+  - The invoice mentions customs duties, import fees, or BOC (Bureau of Customs)
+  - The vendor is clearly a foreign company shipping goods INTO the Philippines
+  - The item description mentions "imported" explicitly
+- Set is_imported = false for:
+  - Services (even from foreign vendors — those are non-resident services, not imports)
+  - Locally purchased goods
+  - When unclear, default to false
 
 Also copy exempt/zero-rated amounts into:
 - totals.vat_exempt_amount, totals.zero_rated_amount (if known).
