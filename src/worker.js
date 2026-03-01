@@ -1781,7 +1781,66 @@ async function isFolderArchived(odoo, companyId, folderId) {
   return false;
 }
 
-async function linkDocumentToBill(odoo, companyId, docId, billId, logger, activeApFolderId = 0, useIsFolder = false) {
+async function ensureAccountingFolderActive(odoo, companyId, journalId, logger) {
+  const folderIds = new Set();
+
+  for (const field of ["documents_account_folder_id"]) {
+    try {
+      const rows = await odoo.searchRead(
+        "res.company", [["id", "=", companyId]], ["id", field], { limit: 1 }
+      );
+      const fid = m2oId(rows?.[0]?.[field]);
+      if (fid) folderIds.add(fid);
+    } catch (_) {}
+  }
+
+  if (journalId) {
+    for (const field of ["documents_folder_id"]) {
+      try {
+        const rows = await odoo.searchRead(
+          "account.journal", [["id", "=", Number(journalId)]], ["id", field], { limit: 1 }
+        );
+        const fid = m2oId(rows?.[0]?.[field]);
+        if (fid) folderIds.add(fid);
+      } catch (_) {}
+    }
+  }
+
+  if (!folderIds.size) {
+    const acctNames = /^(finance|accounting|vendor.bill|bills|factur)/i;
+    for (const model of ["documents.document", "documents.folder"]) {
+      try {
+        const rows = await odoo.searchRead(
+          model,
+          model === "documents.document"
+            ? [["is_folder", "=", true], ["active", "=", false]]
+            : [["active", "=", false]],
+          ["id", "name"],
+          kwWithCompany(companyId, { limit: 50 })
+        );
+        for (const r of rows || []) {
+          if (acctNames.test(String(r.name || ""))) folderIds.add(Number(r.id));
+        }
+      } catch (_) {}
+    }
+  }
+
+  for (const fid of folderIds) {
+    for (const model of ["documents.document", "documents.folder"]) {
+      try {
+        const rows = await odoo.searchRead(model, [["id", "=", fid]], ["id", "active"], { limit: 1 });
+        if (rows?.[0] && (rows[0].active === false || rows[0].active === 0)) {
+          await odoo.write(model, [fid], { active: true });
+          if (logger) logger.info("Unarchived accounting documents folder.", { model, folderId: fid });
+        }
+      } catch (_) {}
+    }
+  }
+}
+
+async function linkDocumentToBill(odoo, companyId, docId, billId, logger, activeApFolderId = 0, useIsFolder = false, journalId = 0) {
+  await ensureAccountingFolderActive(odoo, companyId, journalId, logger);
+
   const docRows = await odoo.searchRead(
     "documents.document",
     [["id", "=", Number(docId)]],
@@ -1992,7 +2051,28 @@ async function processOneDocument(args) {
 
   const currencyCode = String(extracted?.invoice?.currency || "").trim();
   const currencyId = await resolveCurrencyId(odoo, companyId, currencyCode);
-  const taxIds = pickTaxIds(vatIds, extracted);
+  let taxIds = pickTaxIds(vatIds, extracted);
+  if (!taxIds.length) {
+    const cls = String(extracted?.vat?.classification || "").toLowerCase();
+    const anyVatable = (extracted?.line_items || []).some((li) => String(li.vat_code || "").toLowerCase() === "vatable");
+    const hasExtractedTax = Number(extracted?.totals?.tax_total || 0) > 0;
+    if (cls === "vatable" || anyVatable || hasExtractedTax) {
+      try {
+        const autoPick = await pickVatTaxesForCompany(odoo, companyId);
+        const autoVatIds = {
+          goods: autoPick.goodsId || 0,
+          services: autoPick.servicesId || 0,
+          generic: autoPick.genericId || 0
+        };
+        taxIds = pickTaxIds(autoVatIds, extracted);
+        if (taxIds.length) {
+          logger.info("Auto-detected purchase VAT tax from Odoo (target vatIds were empty).", { docId: doc.id, taxIds, autoVatIds });
+        }
+      } catch (err) {
+        logger.warn("VAT auto-detect failed.", { docId: doc.id, error: err?.message || String(err) });
+      }
+    }
+  }
   const taxMeta = await getTaxMeta(odoo, companyId, taxIds);
 
   // --- Vendor research (Google Search grounding) ---
@@ -2112,7 +2192,7 @@ async function processOneDocument(args) {
     description: appendMarker(att.description, marker)
   });
   await attachFileToBillChatter(odoo, companyId, att, Number(billId), Number(doc.id));
-  await linkDocumentToBill(odoo, companyId, Number(doc.id), Number(billId), logger, argApFolderId, argUseIsFolder);
+  await linkDocumentToBill(odoo, companyId, Number(doc.id), Number(billId), logger, argApFolderId, argUseIsFolder, purchaseJournalId);
   await safeMessagePost(
     odoo,
     companyId,
