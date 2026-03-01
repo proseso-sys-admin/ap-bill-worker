@@ -182,10 +182,11 @@ const extractionSchema = {
           unit_price: { type: "number" },
           amount: { type: "number" },
           unit_price_includes_vat: { type: "boolean", description: "true if the unit_price shown on the invoice already includes VAT" },
+          discount_percent: { type: "number", description: "Discount percentage applied to this line (0-100). 0 if no discount. E.g. 5 means 5% discount, so net = unit_price * qty * (1 - 5/100)" },
           expense_category: { type: "string", description: "office_supplies|meals|repairs|rent|fuel|professional_fees|freight|utilities|inventory|other" },
           vat_code: { type: "string", description: "Per-line VAT treatment: vatable|exempt|zero_rated|no_vat. Use 'no_vat' when the line explicitly says NO VAT or is non-vatable. Use 'vatable' when VAT applies." }
         },
-        required: ["description", "quantity", "unit_price", "amount", "unit_price_includes_vat", "expense_category", "vat_code"]
+        required: ["description", "quantity", "unit_price", "amount", "discount_percent", "unit_price_includes_vat", "expense_category", "vat_code"]
       }
     },
     warnings: { type: "array", items: { type: "string" } }
@@ -322,6 +323,14 @@ LINE ITEM CATEGORIZATION:
   consulting/legal/audit -> "professional_fees", food/catering -> "meals", shipping/delivery -> "freight",
   fabric/cloth/textile/thread -> "inventory" or "supplies", hardware/tools -> "supplies", lumber/cement -> "inventory"
 - If the item description is unreadable or a brand name (e.g. "Hiroshi #7" from a fabric vendor), use the VENDOR NAME to determine the category. A fabric vendor sells fabric → "inventory" or "supplies", NOT "other".
+
+DISCOUNT DETECTION (CRITICAL):
+- Look for a "Disc.%", "Discount", or "Disc" column on the invoice.
+- If a line shows a discount (e.g. 5%, 10%), set discount_percent to that value (e.g. 5, 10).
+- Verify: amount should equal unit_price * quantity * (1 - discount_percent/100).
+- If there is no discount column or the discount is 0, set discount_percent to 0.
+- unit_price must be the ORIGINAL price BEFORE discount. amount is the final line total AFTER discount.
+- Do NOT bake the discount into unit_price. Keep them separate.
 
 CURRENCY DETECTION (CRITICAL):
 - Look for currency SYMBOLS and CODES on the invoice:

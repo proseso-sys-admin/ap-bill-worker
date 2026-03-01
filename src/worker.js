@@ -1638,12 +1638,14 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
       }
 
       const itemVatInclusive = lineHasTax && (globalVatInclusive || (item.unit_price_includes_vat ?? false));
+      const discount = Number(item.discount_percent || 0);
       const rawPrice = Number(item.unit_price || item.amount || 0);
       const line = {
         name: String(item.description || "Line item").slice(0, 256),
         quantity: Number(item.quantity) || 1,
         price_unit: lineHasTax ? adjustPriceForTax(rawPrice, itemVatInclusive, taxPriceInclude, taxRate) : rawPrice
       };
+      if (discount > 0 && discount < 100) line.discount = discount;
       const acctId = lineAccountIds?.[i] || 0;
       if (acctId) line.account_id = acctId;
       if (lineHasTax) line.tax_ids = [[6, 0, taxIds]];
@@ -1653,7 +1655,8 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
     if (!hasPerLineVat && expectedUntaxed > 0 && invoiceLines.length > 0) {
       const lineUntaxedSum = invoiceLines.reduce((s, entry) => {
         const l = entry[2];
-        return s + (l.price_unit * l.quantity);
+        const disc = Number(l.discount || 0) / 100;
+        return s + (l.price_unit * l.quantity * (1 - disc));
       }, 0);
       const diff = expectedUntaxed - lineUntaxedSum;
       if (Math.abs(diff) > 0.005) {
@@ -1661,13 +1664,14 @@ function buildBillVals(extracted, vendorId, companyId, taxIds, purchaseJournalId
         let bestScore = -Infinity;
         for (let i = 0; i < invoiceLines.length; i++) {
           const l = invoiceLines[i][2];
-          const lineTotal = l.price_unit * l.quantity;
+          const disc = Number(l.discount || 0) / 100;
+          const lineTotal = l.price_unit * l.quantity * (1 - disc);
           const perUnitAdj = Math.abs(diff) / (l.quantity || 1);
           const adjRatio = perUnitAdj / (l.price_unit || 1);
           const score = lineTotal - adjRatio * 1e6;
-          if (l.quantity === 1 || adjRatio < 0.001) {
+          if ((l.quantity === 1 || adjRatio < 0.001) && disc === 0) {
             if (score > bestScore) { bestScore = score; bestIdx = i; }
-          } else if (bestScore === -Infinity) {
+          } else if (bestScore === -Infinity && disc === 0) {
             bestScore = score; bestIdx = i;
           }
         }
@@ -2211,12 +2215,14 @@ async function processOneDocument(args) {
       const desc = li ? String(li.description || "").trim() : "Vendor Bill";
       const qty = li ? Number(li.quantity) || 1 : 1;
       const priceUnit = li ? Number(li.unit_price || li.amount || 0) : grandTotalSnapshot;
+      const discPct = li ? Number(li.discount_percent || 0) : 0;
       snapshotLines.push({
         account_id: acctId || 0,
         account_code: acct ? String(acct.code || "").trim() : "",
         account_name: acct ? String(acct.name || "").trim() : "",
         price_unit: priceUnit,
         quantity: qty,
+        discount: discPct,
         description: desc.slice(0, 256),
         resolution_source: lineAccountSources[i] || ""
       });
