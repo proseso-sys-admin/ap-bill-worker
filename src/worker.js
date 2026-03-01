@@ -141,9 +141,6 @@ function isEnabledRow(row) {
 
 function ensureAutoColumns(headers, rows) {
   const wanted = [
-    "vat_purchase_tax_id_goods",
-    "vat_purchase_tax_id_services",
-    "vat_purchase_tax_id_generic",
     "purchase_journal_id",
     "ap_folder_id",
     "industry"
@@ -307,7 +304,6 @@ async function refreshRoutingAutoFields(headers, rows, logger, sourceMap = null)
   for (const [key, g] of groups.entries()) {
     try {
       const odoo = new OdooClient(g.cfg);
-      const pick = await pickVatTaxesForCompany(odoo, g.companyId);
 
       let journalId = 0;
       try { journalId = await resolvePurchaseJournalId(odoo, g.companyId); } catch (_) {}
@@ -326,25 +322,16 @@ async function refreshRoutingAutoFields(headers, rows, logger, sourceMap = null)
           logger.info("Industry from General task (source only).", { projectId: pid, industry: industryVal });
         }
         const before = [
-          String(row.vat_purchase_tax_id_goods || "").trim(),
-          String(row.vat_purchase_tax_id_services || "").trim(),
-          String(row.vat_purchase_tax_id_generic || "").trim(),
           String(row.purchase_journal_id || "").trim(),
           String(row.ap_folder_id || "").trim(),
           String(row.industry || "").trim()
         ].join("|");
 
-        row.vat_purchase_tax_id_goods = pick.goodsId ? String(pick.goodsId) : "";
-        row.vat_purchase_tax_id_services = pick.servicesId ? String(pick.servicesId) : "";
-        row.vat_purchase_tax_id_generic = pick.genericId ? String(pick.genericId) : "";
         if (journalId) row.purchase_journal_id = String(journalId);
         if (apFolderId) row.ap_folder_id = String(apFolderId);
-        if (industryVal) row.industry = industryVal; // industry is source-only (General task), no target fallback
+        if (industryVal) row.industry = industryVal;
 
         const after = [
-          String(row.vat_purchase_tax_id_goods || "").trim(),
-          String(row.vat_purchase_tax_id_services || "").trim(),
-          String(row.vat_purchase_tax_id_generic || "").trim(),
           String(row.purchase_journal_id || "").trim(),
           String(row.ap_folder_id || "").trim(),
           String(row.industry || "").trim()
@@ -421,10 +408,6 @@ async function getTargetsFromOdoo(logger) {
   const g = (key) => (gcsFields[key] != null && String(gcsFields[key]).trim() !== "" ? String(gcsFields[key]).trim() : src[key]);
   const apFolderField = g("sourceGeneralTaskApFolderField");
   const purchaseJournalField = g("sourceGeneralTaskPurchaseJournalField");
-  const vatGoodsField = g("sourceGeneralTaskVatGoodsField");
-  const vatServicesField = g("sourceGeneralTaskVatServicesField");
-  const vatGenericField = g("sourceGeneralTaskVatGenericField");
-
   const fields = ["id", "project_id", dbField, industryField];
   if (enabledField) fields.push(enabledField);
   if (billWorkerField) fields.push(billWorkerField);
@@ -432,7 +415,7 @@ async function getTargetsFromOdoo(logger) {
   if (companyIdField) fields.push(companyIdField);
   if (emailField) fields.push(emailField);
   if (passwordField) fields.push(passwordField);
-  const accountingFields = [apFolderField, purchaseJournalField, vatGoodsField, vatServicesField, vatGenericField].filter(Boolean);
+  const accountingFields = [apFolderField, purchaseJournalField].filter(Boolean);
   accountingFields.forEach((f) => {
     if (!fields.includes(f)) fields.push(f);
   });
@@ -499,12 +482,7 @@ async function getTargetsFromOdoo(logger) {
     const fromTask = {
       apFolderId: m2oId(apFolderField ? task[apFolderField] : null),
       apFolderParent: "",
-      purchaseJournalId: m2oId(purchaseJournalField ? task[purchaseJournalField] : null),
-      vatIds: {
-        goods: m2oId(vatGoodsField ? task[vatGoodsField] : null),
-        services: m2oId(vatServicesField ? task[vatServicesField] : null),
-        generic: m2oId(vatGenericField ? task[vatGenericField] : null)
-      }
+      purchaseJournalId: m2oId(purchaseJournalField ? task[purchaseJournalField] : null)
     };
     let accounting = fromTask;
     if (useCache) {
@@ -525,7 +503,6 @@ async function getTargetsFromOdoo(logger) {
       apFolderId: accounting.apFolderId,
       apFolderParent: accounting.apFolderParent || "",
       purchaseJournalId: accounting.purchaseJournalId,
-      vatIds: accounting.vatIds,
       industry
     });
   }
@@ -560,11 +537,6 @@ function groupRoutingRows(rows) {
         apFolderId: row.ap_folder_id || 0,
         apFolderParent: row.ap_folder_parent || "",
         purchaseJournalId: row.purchase_journal_id || 0,
-        vatIds: {
-          goods: row.vat_purchase_tax_id_goods || 0,
-          services: row.vat_purchase_tax_id_services || 0,
-          generic: row.vat_purchase_tax_id_generic || 0
-        },
         industry: String(row.industry || "").trim()
       });
     }
@@ -1907,7 +1879,7 @@ async function processOneDocument(args) {
     companyId,
     targetKey,
     doc,
-    vatIds,
+    resolvedVatIds,
     purchaseJournalId,
     industry,
     reprocess = false,
@@ -2051,28 +2023,7 @@ async function processOneDocument(args) {
 
   const currencyCode = String(extracted?.invoice?.currency || "").trim();
   const currencyId = await resolveCurrencyId(odoo, companyId, currencyCode);
-  let taxIds = pickTaxIds(vatIds, extracted);
-  if (!taxIds.length) {
-    const cls = String(extracted?.vat?.classification || "").toLowerCase();
-    const anyVatable = (extracted?.line_items || []).some((li) => String(li.vat_code || "").toLowerCase() === "vatable");
-    const hasExtractedTax = Number(extracted?.totals?.tax_total || 0) > 0;
-    if (cls === "vatable" || anyVatable || hasExtractedTax) {
-      try {
-        const autoPick = await pickVatTaxesForCompany(odoo, companyId);
-        const autoVatIds = {
-          goods: autoPick.goodsId || 0,
-          services: autoPick.servicesId || 0,
-          generic: autoPick.genericId || 0
-        };
-        taxIds = pickTaxIds(autoVatIds, extracted);
-        if (taxIds.length) {
-          logger.info("Auto-detected purchase VAT tax from Odoo (target vatIds were empty).", { docId: doc.id, taxIds, autoVatIds });
-        }
-      } catch (err) {
-        logger.warn("VAT auto-detect failed.", { docId: doc.id, error: err?.message || String(err) });
-      }
-    }
-  }
+  const taxIds = pickTaxIds(resolvedVatIds, extracted);
   const taxMeta = await getTaxMeta(odoo, companyId, taxIds);
 
   // --- Vendor research (Google Search grounding) ---
@@ -2326,6 +2277,13 @@ async function processTargetGroup(target, startMs, logger) {
   const odoo = new OdooClient(target.targetCfg);
   const state = await loadState(config, target.targetKey);
 
+  const vatPick = await pickVatTaxesForCompany(odoo, target.companyId);
+  const resolvedVatIds = {
+    goods: vatPick.goodsId || 0,
+    services: vatPick.servicesId || 0,
+    generic: vatPick.genericId || 0
+  };
+
   let apFolderId = Number(target.apFolderId || 0);
   let useIsFolder = false;
   if (!apFolderId) {
@@ -2368,7 +2326,7 @@ async function processTargetGroup(target, startMs, logger) {
         companyId: target.companyId,
         targetKey: target.targetKey,
         doc,
-        vatIds: target.vatIds,
+        resolvedVatIds,
         purchaseJournalId: target.purchaseJournalId,
         industry: target.industry,
         apFolderId,
@@ -2489,6 +2447,13 @@ async function runOne({ logger, payload = {} }) {
     }
   }
 
+  const vatPick = await pickVatTaxesForCompany(odoo, companyId);
+  const resolvedVatIds = {
+    goods: vatPick.goodsId || 0,
+    services: vatPick.servicesId || 0,
+    generic: vatPick.genericId || 0
+  };
+
   let runOneApFolderId = Number(target.apFolderId || 0);
   let runOneUseIsFolder = false;
   if (!runOneApFolderId) {
@@ -2504,7 +2469,7 @@ async function runOne({ logger, payload = {} }) {
     companyId,
     targetKey: target.targetKey,
     doc,
-    vatIds: target.vatIds,
+    resolvedVatIds,
     purchaseJournalId: target.purchaseJournalId,
     industry: target.industry,
     reprocess: !!(payload.reprocess || payload.force_reprocess),

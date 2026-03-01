@@ -54,12 +54,7 @@ async function loadAccountingConfigCache(config, targetKey) {
   return {
     apFolderId: Number(raw.apFolderId || 0),
     apFolderParent: String(raw.apFolderParent || "").trim(),
-    purchaseJournalId: Number(raw.purchaseJournalId || 0),
-    vatIds: {
-      goods: Number(raw.vatIds?.goods || 0),
-      services: Number(raw.vatIds?.services || 0),
-      generic: Number(raw.vatIds?.generic || 0)
-    }
+    purchaseJournalId: Number(raw.purchaseJournalId || 0)
   };
 }
 
@@ -69,12 +64,7 @@ async function saveAccountingConfigCache(config, targetKey, accounting) {
     fetched_at: new Date().toISOString(),
     apFolderId: Number(accounting.apFolderId || 0),
     apFolderParent: String(accounting.apFolderParent || "").trim(),
-    purchaseJournalId: Number(accounting.purchaseJournalId || 0),
-    vatIds: {
-      goods: Number(accounting.vatIds?.goods || 0),
-      services: Number(accounting.vatIds?.services || 0),
-      generic: Number(accounting.vatIds?.generic || 0)
-    }
+    purchaseJournalId: Number(accounting.purchaseJournalId || 0)
   };
   await writeJsonObject(config.gcs.stateBucket, accountingConfigObjectName(config, targetKey), payload);
 }

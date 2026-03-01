@@ -80,9 +80,7 @@ const config = {
     sourceGeneralTaskPasswordField: process.env.SOURCE_GENERAL_TASK_PASSWORD_FIELD || "x_studio_api_key",
     sourceGeneralTaskApFolderField: process.env.SOURCE_GENERAL_TASK_AP_FOLDER_FIELD || "x_studio_ap_folder_id",
     sourceGeneralTaskPurchaseJournalField: process.env.SOURCE_GENERAL_TASK_PURCHASE_JOURNAL_FIELD || "x_studio_purchase_journal_id",
-    sourceGeneralTaskVatGoodsField: process.env.SOURCE_GENERAL_TASK_VAT_GOODS_FIELD || "x_studio_vat_purchase_tax_id_goods",
-    sourceGeneralTaskVatServicesField: process.env.SOURCE_GENERAL_TASK_VAT_SERVICES_FIELD || "x_studio_vat_purchase_tax_id_services",
-    sourceGeneralTaskVatGenericField: process.env.SOURCE_GENERAL_TASK_VAT_GENERIC_FIELD || "x_studio_vat_purchase_tax_id_generic",
+    // VAT purchase tax IDs are auto-resolved from the target database at runtime (pickVatTaxesForCompany).
     routingStageName: process.env.ROUTING_STAGE_NAME || "Master",
     taxTaskNameFilter: process.env.TAX_TASK_NAME_FILTER || "Tax PH"
   },

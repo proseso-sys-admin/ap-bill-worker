@@ -65,9 +65,6 @@ function toRoutingRowStrict(row) {
     ap_folder_id: toNumber(row.ap_folder_id, 0),
     ap_folder_parent: String(row.ap_folder_parent ?? "").trim() || undefined,
     purchase_journal_id: toNumber(row.purchase_journal_id, 0),
-    vat_purchase_tax_id_goods: toNumber(row.vat_purchase_tax_id_goods, 0),
-    vat_purchase_tax_id_services: toNumber(row.vat_purchase_tax_id_services, 0),
-    vat_purchase_tax_id_generic: toNumber(row.vat_purchase_tax_id_generic, 0),
     industry: String(row.industry || "").trim()
   };
 }
@@ -95,7 +92,6 @@ function indexToColLetter(idx) {
 async function saveRoutingSheetData(config, headers, rows) {
   if (config.routing?.source === "odoo") return;
   const vatCols = [
-    "vat_purchase_tax_id_goods", "vat_purchase_tax_id_services", "vat_purchase_tax_id_generic",
     "purchase_journal_id", "ap_folder_id", "industry"
   ];
   const sheets = await getSheetsClient();
