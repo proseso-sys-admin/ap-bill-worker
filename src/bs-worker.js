@@ -10,6 +10,8 @@ const { validateExtraction, checkDuplicate, checkContinuity, fmtNum } = require(
 const { reconcileStatementLines } = require("./bs-reconcile");
 const { makeProcessedMarker, isProcessed, appendMarker } = require("./markers");
 
+const BS_DOC_FIELDS = ["id", "name", "folder_id", "workspace_id", "attachment_id", "create_uid"];
+
 function outOfTime(startMs) {
   return Date.now() - startMs > config.budget.runBudgetMs - config.budget.reserveMs;
 }
@@ -274,9 +276,7 @@ async function processBsTarget(target, startMs, logger) {
 
   let docs = [];
   try {
-    let fieldsToFetch = ["id", "name", "attachment_id", "create_uid"];
-    if (folderId) fieldsToFetch.push("folder_id");
-    if (workspaceId) fieldsToFetch.push("workspace_id");
+    let fieldsToFetch = [...BS_DOC_FIELDS];
     
     docs = await odoo.searchRead(
       "documents.document",
@@ -351,7 +351,7 @@ async function runBsOne({ logger, payload = {} }) {
 
   const docs = await odoo.searchRead(
     "documents.document", [["id", "=", docId]],
-    ["id", "name", "folder_id", "workspace_id", "attachment_id", "create_uid"],
+    BS_DOC_FIELDS,
     kwWithCompany(companyId, { limit: 1 })
   );
   if (!docs.length) throw new Error(`Document ${docId} not found.`);
