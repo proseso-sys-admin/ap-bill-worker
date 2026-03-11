@@ -256,7 +256,7 @@ app.post("/webhook/document-upload", async (req, res) => {
     return res.status(400).json({ ok: false, error: "doc_id or attachment_id required" });
   }
   runOneCount += 1;
-  const retryDelaysMs = [0, 200, 400, 800]; // instant first try; backoff only when race (document/attachment not committed yet)
+  const retryDelaysMs = [0, 1000, 2000, 2000]; // instant first try; backoff only when race (document/attachment not committed yet)
   let lastError = null;
   let lastResult = null;
   try {
@@ -416,7 +416,7 @@ app.post("/webhook/bs-document-upload", async (req, res) => {
   if (!docId) return res.status(400).json({ ok: false, error: "doc_id required" });
 
   bsRunOneCount += 1;
-  const retryDelaysMs = [0, 200, 400, 800];
+  const retryDelaysMs = [0, 1000, 2000, 2000];
   let lastError = null;
   let lastResult = null;
   try {
