@@ -1978,6 +1978,7 @@ async function processOneDocument(args) {
     purchaseJournalId,
     industry,
     reprocess = false,
+    force = false,
     apFolderId: argApFolderId = 0,
     useIsFolder: argUseIsFolder = false,
     userHint = ""
@@ -1985,19 +1986,47 @@ async function processOneDocument(args) {
   const attachmentId = m2oId(doc.attachment_id);
   if (!attachmentId) return { status: "skip", reason: "no_attachment" };
 
-  if (!reprocess) {
-    const linkedModel = String(doc.res_model || "").trim();
-    const linkedId = Number(doc.res_id || 0);
-    if (linkedModel === "account.move" && linkedId) {
-      const billRows = await odoo.searchRead(
-        "account.move",
-        [["id", "=", linkedId]],
-        ["id", "state"],
-        kwWithCompany(companyId, { limit: 1 })
-      );
-      if (billRows?.length) {
-        return { status: "skip", reason: "already_linked", billId: linkedId, billState: String(billRows[0].state || "") };
+  const linkedModel = String(doc.res_model || "").trim();
+  const linkedId = Number(doc.res_id || 0);
+  if (linkedModel === "account.move" && linkedId) {
+    const billRows = await odoo.searchRead(
+      "account.move",
+      [["id", "=", linkedId]],
+      ["id", "state"],
+      kwWithCompany(companyId, { limit: 1 })
+    );
+    if (billRows?.length) {
+      const billState = String(billRows[0].state || "");
+      if (!reprocess) {
+        return { status: "skip", reason: "already_linked", billId: linkedId, billState };
       }
+      if (billState === "draft") {
+        logger.info("Deleting old draft bill for retry.", { docId: doc.id, billId: linkedId });
+        try {
+          await odoo.executeKw("account.move", "unlink", [[linkedId]], kwWithCompany(companyId));
+          const clearVals = { res_model: false, res_id: false };
+          if (await documentsDocumentHasField(odoo, "account_move_id")) clearVals.account_move_id = false;
+          if (await documentsDocumentHasField(odoo, "invoice_id")) clearVals.invoice_id = false;
+          await odoo.write("documents.document", [Number(doc.id)], clearVals);
+          doc.res_model = false;
+          doc.res_id = false;
+        } catch (e) {
+          logger.warn("Failed to delete old draft bill on retry.", { error: e.message });
+        }
+      } else if (!force) {
+        logger.info("Bill is not draft; refusing to retry without force.", { docId: doc.id, billId: linkedId });
+        await safeMessagePost(odoo, companyId, "documents.document", doc.id,
+          "⚠️ <b>🤖 Bot:</b> Cannot retry because the linked bill is already posted/cancelled. Use <b>@bot force</b> to create a duplicate draft anyway.");
+        return { status: "skip", reason: "posted_no_force", billId: linkedId, billState };
+      }
+      // force=true with a posted bill: fall through and create a new draft
+    } else {
+      // Bill link exists but bill was deleted — clear the stale link
+      logger.info("Clearing stale bill link from document (bill was deleted).", { docId: doc.id, staleBillId: linkedId });
+      const clearVals = { res_model: false, res_id: false };
+      if (await documentsDocumentHasField(odoo, "account_move_id")) clearVals.account_move_id = false;
+      if (await documentsDocumentHasField(odoo, "invoice_id")) clearVals.invoice_id = false;
+      await odoo.write("documents.document", [Number(doc.id)], clearVals);
     }
   }
 
@@ -2569,6 +2598,7 @@ async function runOne({ logger, payload = {} }) {
     purchaseJournalId: target.purchaseJournalId,
     industry: target.industry,
     reprocess: forceReprocess,
+    force: isForce,
     apFolderId,
     useIsFolder,
     userHint
