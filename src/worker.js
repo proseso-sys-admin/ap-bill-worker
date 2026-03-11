@@ -804,7 +804,8 @@ async function safeMessagePost(odoo, companyId, model, resId, body) {
       })
     );
   } catch (_err) {
-    // best effort
+    // best effort — log so silent failures are visible in Cloud Run logs
+    console.warn("[safeMessagePost] failed", { model, resId, error: _err?.message || String(_err) });
   }
 }
 
@@ -2290,7 +2291,13 @@ async function processOneDocument(args) {
     description: appendMarker(att.description, marker)
   });
   await attachFileToBillChatter(odoo, companyId, att, Number(billId), Number(doc.id));
-  await linkDocumentToBill(odoo, companyId, Number(doc.id), Number(billId), logger, argApFolderId, argUseIsFolder, purchaseJournalId);
+  try {
+    await linkDocumentToBill(odoo, companyId, Number(doc.id), Number(billId), logger, argApFolderId, argUseIsFolder, purchaseJournalId);
+  } catch (linkErr) {
+    logger.warn("linkDocumentToBill failed; extraction chatter will still be posted.", {
+      docId: doc.id, billId, error: linkErr?.message || String(linkErr)
+    });
+  }
   await safeMessagePost(
     odoo,
     companyId,
