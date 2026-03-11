@@ -19,8 +19,10 @@ app.use((req, res, next) => {
 
 let isRunning = false;
 let runOneCount = 0;
+const inFlightDocs = new Set();
 let isBsRunning = false;
 let bsRunOneCount = 0;
+const bsInFlightDocs = new Set();
 
 function isAuthorized(req, bodySecret = null) {
   if (!config.server.sharedSecret) return true;
@@ -256,7 +258,12 @@ app.post("/webhook/document-upload", async (req, res) => {
   if (!docId && !attachmentId) {
     return res.status(400).json({ ok: false, error: "doc_id or attachment_id required" });
   }
+  if (inFlightDocs.has(docId)) {
+    logger.info("Webhook document-upload: duplicate ignored.", { doc_id: docId, runOneCount });
+    return res.status(200).json({ ok: true, message: "duplicate ignored" });
+  }
   runOneCount += 1;
+  inFlightDocs.add(docId);
   const retryDelaysMs = [0, 1000, 2000, 2000]; // instant first try; backoff only when race (document/attachment not committed yet)
   let lastError = null;
   let lastResult = null;
@@ -290,6 +297,7 @@ app.post("/webhook/document-upload", async (req, res) => {
     return res.status(500).json({ ok: false, error: msg });
   } finally {
     runOneCount -= 1;
+    inFlightDocs.delete(docId);
   }
 });
 
@@ -415,8 +423,13 @@ app.post("/webhook/bs-document-upload", async (req, res) => {
   const docId = Number(payload.doc_id || payload.document_id || payload.id || 0);
   const targetKey = String(payload.target_key || "").trim();
   if (!docId) return res.status(400).json({ ok: false, error: "doc_id required" });
+  if (bsInFlightDocs.has(docId)) {
+    logger.info("Webhook bs-document-upload: duplicate ignored.", { doc_id: docId, runOneCount: bsRunOneCount });
+    return res.status(200).json({ ok: true, message: "duplicate ignored" });
+  }
 
   bsRunOneCount += 1;
+  bsInFlightDocs.add(docId);
   const retryDelaysMs = [0, 1000, 2000, 2000];
   let lastError = null;
   let lastResult = null;
@@ -440,6 +453,7 @@ app.post("/webhook/bs-document-upload", async (req, res) => {
     return res.status(500).json({ ok: false, error: lastError?.message });
   } finally {
     bsRunOneCount -= 1;
+    bsInFlightDocs.delete(docId);
   }
 });
 
