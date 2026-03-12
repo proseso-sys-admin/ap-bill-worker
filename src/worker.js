@@ -1025,8 +1025,18 @@ function pickBillLevelTaxIds(taxMap, extracted, vendorCountry) {
   const anyLineVatable = lineItems.some((li) => String(li.vat_code || "").toLowerCase() === "vatable");
 
   // Foreign vendors: their local tax (GST/VAT) is not PH input VAT — fully expense
-  const foreignAddr = String(vendorCountry || "").toLowerCase();
-  const isPH = !foreignAddr || /philipp|^ph$/i.test(foreignAddr);
+  // If we have an object with a country, check it. Otherwise, fallback to checking the string.
+  let isPH = true;
+  if (typeof extracted?.vendor_details?.address === "object" && extracted?.vendor_details?.address !== null) {
+    const country = String(extracted.vendor_details.address.country || "").toLowerCase().trim();
+    if (country && !/philipp|^ph$/i.test(country)) {
+      isPH = false;
+    }
+  } else {
+    const foreignAddr = String(vendorCountry || "").toLowerCase();
+    isPH = !foreignAddr || /philipp|^ph$|makati|manila|quezon|pasig|taguig|cebu|davao/i.test(foreignAddr);
+  }
+
   if (!isPH) return [];
 
   if (!anyLineVatable && (classification === "exempt" || classification === "zero_rated" || classification === "unknown")) {
@@ -1040,12 +1050,25 @@ function pickBillLevelTaxIds(taxMap, extracted, vendorCountry) {
   return taxMap.genericId ? [taxMap.genericId] : [];
 }
 
-function pickLineTaxIds(taxMap, lineItem, billGoodsOrServices, vendorCountry) {
+function pickLineTaxIds(taxMap, lineItem, billGoodsOrServices, vendorCountry, extracted) {
   const vatCode = String(lineItem.vat_code || "").toLowerCase();
   const gs = String(lineItem.goods_or_services || billGoodsOrServices || "").toLowerCase();
   const isCapital = !!(lineItem.is_capital_goods);
   const isImported = !!(lineItem.is_imported);
   const cat = String(lineItem.expense_category || "").toLowerCase();
+
+  let isPH = true;
+  if (typeof extracted?.vendor_details?.address === "object" && extracted?.vendor_details?.address !== null) {
+    const country = String(extracted.vendor_details.address.country || "").toLowerCase().trim();
+    if (country && !/philipp|^ph$/i.test(country)) {
+      isPH = false;
+    }
+  } else {
+    const foreignAddr = String(vendorCountry || "").toLowerCase();
+    isPH = !foreignAddr || /philipp|^ph$|makati|manila|quezon|pasig|taguig|cebu|davao/i.test(foreignAddr);
+  }
+
+  if (!isPH && !isImported) return [];
 
   if (vatCode === "exempt") {
     if (isImported && taxMap.exemptImportsId) return [taxMap.exemptImportsId];
@@ -1792,7 +1815,7 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
 
       let lineTaxIds;
       if (hasPerLineVat && lineVatCode) {
-        lineTaxIds = pickLineTaxIds(taxMap, item, billGs, vendorCountry);
+        lineTaxIds = pickLineTaxIds(taxMap, item, billGs, vendorCountry, extracted);
       } else {
         lineTaxIds = billLevelTaxIds;
       }
@@ -2224,7 +2247,7 @@ async function processOneDocument(args) {
         doc.id,
         `⚠️ Manual review required: vendor not confidently matched.\n` +
           `Extracted vendor=${extracted?.vendor?.name || "(blank)"} conf=${Number(extracted?.vendor?.confidence || 0)} source=${extracted?.vendor?.source || "unknown"}\n` +
-          `TIN=${extracted?.vendor_details?.tin || "(none)"} Address=${extracted?.vendor_details?.address || "(none)"}`
+          `TIN=${extracted?.vendor_details?.tin || "(none)"} Address=${typeof extracted?.vendor_details?.address === 'object' ? JSON.stringify(extracted?.vendor_details?.address) : extracted?.vendor_details?.address || "(none)"}`
       );
       return { status: "skip", reason: "vendor_not_found", manual_review: true };
     }
@@ -2250,7 +2273,16 @@ async function processOneDocument(args) {
   const currencyCode = String(extracted?.invoice?.currency || "").trim();
   const currencyId = await resolveCurrencyId(odoo, companyId, currencyCode);
   const taxMap = resolvedVatIds;
-  const vendorCountry = String(extracted?.vendor_details?.address || "").trim();
+  let vendorCountry = "";
+  if (typeof extracted?.vendor_details?.address === "object" && extracted?.vendor_details?.address !== null) {
+    vendorCountry = [
+      extracted.vendor_details.address.country,
+      extracted.vendor_details.address.state,
+      extracted.vendor_details.address.city
+    ].filter(Boolean).join(" ");
+  } else {
+    vendorCountry = String(extracted?.vendor_details?.address || "").trim();
+  }
   const billLevelTaxIds = pickBillLevelTaxIds(taxMap, extracted, vendorCountry);
   const taxMeta = billLevelTaxIds.length ? await getTaxMeta(odoo, companyId, billLevelTaxIds) : taxMap._meta;
 
@@ -2422,7 +2454,7 @@ async function processOneDocument(args) {
       tn && tn.toLowerCase() !== (vendor.name || "").toLowerCase() ? `Trade name: ${tn}` : null,
       pn ? `Proprietor/Owner: ${pn}` : null,
       vd.tin ? `TIN: ${vd.tin}` : null,
-      vd.address ? `Address: ${vd.address}` : null,
+      vd.address ? `Address: ${typeof vd.address === 'object' ? Object.values(vd.address).filter(Boolean).join(", ") : vd.address}` : null,
       vendor.created ? `<i>Vendor auto-created in Odoo (as ${et === "sole_proprietor" || et === "individual" ? "Individual" : "Company"})</i>` : null
     ].filter(Boolean).join("<br/>");
     await safeMessagePost(odoo, companyId, "account.move", Number(billId), vendorMsg);
