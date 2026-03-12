@@ -1085,9 +1085,6 @@ function pickLineTaxIds(taxMap, lineItem, billGoodsOrServices, vendorCountry, ex
 
   if (isImported && taxMap.importsId) return [taxMap.importsId];
 
-  const foreignCountry = String(vendorCountry || "").toLowerCase();
-  const isPH = !foreignCountry || /philipp|^ph$/i.test(foreignCountry);
-
   // Foreign vendors: their local tax (GST/VAT) is not PH input VAT — fully expense
   if (!isPH) return [];
 
