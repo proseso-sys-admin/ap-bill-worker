@@ -504,7 +504,13 @@ app.post("/webhook/bs-chatter-message", async (req, res) => {
 // ---------------------------------------------------------------------------
 
 function start() {
-  validateConfig();
+  try {
+    validateConfig();
+  } catch (err) {
+    logger.error("Config validation failed.", { error: err.message });
+    // Optional: exit gracefully if config is invalid, depending on desired behavior
+    // process.exit(1); 
+  }
   app.listen(config.server.port, () => {
     logger.info("Server started.", { port: config.server.port });
   });

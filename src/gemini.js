@@ -84,10 +84,28 @@ const extractionSchema = {
       properties: {
         tin: { type: "string" },
         branch_code: { type: "string" },
-        address: { type: "string" },
+        address: {
+          type: "object",
+          properties: {
+            street: { type: "string", description: "Street name and number, building name" },
+            street2: { type: "string", description: "Apartment, suite, unit, etc." },
+            city: { type: "string", description: "City or municipality" },
+            state: { type: "string", description: "Province or state" },
+            zip: { type: "string", description: "Postal or ZIP code" },
+            country: { type: "string", description: "Country name" }
+          }
+        },
         entity_type: { type: "string", description: "corporation|sole_proprietor|individual|unknown" },
         trade_name: { type: "string", description: "Business/trade name (DBA). For sole proprietors this is the shop/store name that differs from the owner's personal name" },
-        proprietor_name: { type: "string", description: "Owner/proprietor personal name if entity is a sole proprietor (e.g. 'JOCELYN E. SANTOS' when trade name is 'JORJEL LAUNDRY SHOP')" }
+        proprietor_name: {
+          type: "object",
+          description: "Owner/proprietor personal name if entity is a sole proprietor",
+          properties: {
+            first_name: { type: "string" },
+            middle_name: { type: "string" },
+            last_name: { type: "string" }
+          }
+        }
       },
       required: ["tin", "branch_code", "address", "entity_type", "trade_name", "proprietor_name"]
     },

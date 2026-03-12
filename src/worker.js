@@ -865,7 +865,13 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
   const entityType = String(details.entity_type || "unknown").toLowerCase();
   const isSoleProp = entityType === "sole_proprietor" || entityType === "individual";
   const tradeName = String(details.trade_name || "").trim();
-  const proprietorName = String(details.proprietor_name || "").trim();
+  
+  let proprietorName = "";
+  if (typeof details.proprietor_name === "object" && details.proprietor_name !== null) {
+    proprietorName = [details.proprietor_name.first_name, details.proprietor_name.middle_name, details.proprietor_name.last_name].filter(Boolean).join(" ");
+  } else {
+    proprietorName = String(details.proprietor_name || "").trim();
+  }
 
   const name = isSoleProp && proprietorName ? proprietorName : rawName;
 
@@ -889,36 +895,124 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
     name,
     supplier_rank: 1
   };
-  if (String(details.address || "").trim()) vals.street = String(details.address).trim().slice(0, 255);
-  if (String(details.tin || "").trim()) vals.vat = String(details.tin).trim();
-  const notes = [];
-  if (isSoleProp && tradeName) notes.push(`Trade name: ${tradeName}`);
-  if (isSoleProp && proprietorName && proprietorName.toLowerCase() !== name.toLowerCase()) {
-    notes.push(`Proprietor: ${proprietorName}`);
+
+  if (typeof details.address === "object" && details.address !== null) {
+    if (details.address.street) vals.street = String(details.address.street).trim().slice(0, 255);
+    if (details.address.street2) vals.street2 = String(details.address.street2).trim().slice(0, 255);
+    if (details.address.city) vals.city = String(details.address.city).trim().slice(0, 255);
+    if (details.address.zip) vals.zip = String(details.address.zip).trim().slice(0, 255);
+  } else if (String(details.address || "").trim()) {
+    vals.street = String(details.address).trim().slice(0, 255);
   }
-  if (tradeName && !isSoleProp && tradeName.toLowerCase() !== name.toLowerCase()) {
-    notes.push(`DBA: ${tradeName}`);
+
+  if (String(details.tin || "").trim()) {
+    const rawTin = String(details.tin).trim();
+    const cleanTin = rawTin.replace(/\D/g, "");
+    if (cleanTin.length >= 9) {
+      vals.vat = cleanTin.slice(0, 9);
+      if (cleanTin.length >= 12) {
+        vals.branch_code = cleanTin.slice(-3);
+      } else {
+        vals.branch_code = "000";
+      }
+    } else {
+      vals.vat = rawTin;
+    }
+  }
+
+  const notes = [];
+  if (isSoleProp) {
+    vals.company_type = "person";
+    vals.is_company = false;
+    if (tradeName) {
+      vals.commercial_company_name = tradeName;
+      notes.push(`Trade name: ${tradeName}`);
+    }
+    if (typeof details.proprietor_name === "object" && details.proprietor_name !== null) {
+      if (details.proprietor_name.first_name) vals.first_name = details.proprietor_name.first_name;
+      if (details.proprietor_name.middle_name) vals.middle_name = details.proprietor_name.middle_name;
+      if (details.proprietor_name.last_name) vals.last_name = details.proprietor_name.last_name;
+    }
+  } else {
+    vals.company_type = "company";
+    vals.is_company = true;
+    if (tradeName && tradeName.toLowerCase() !== name.toLowerCase()) {
+      vals.commercial_company_name = tradeName;
+      notes.push(`DBA: ${tradeName}`);
+    }
   }
   if (notes.length) vals.comment = notes.join("\n");
   let newId;
+
+  const createWithFallback = async (payload) => {
+    let currentPayload = { ...payload };
+    try {
+      return await odoo.create("res.partner", currentPayload);
+    } catch (e) {
+      const errMsg = String(e?.message || "");
+      if (errMsg.includes("company_type") || errMsg.includes("is_company")) {
+        delete currentPayload.company_type;
+        currentPayload.is_company = !isSoleProp;
+        try {
+          return await odoo.create("res.partner", currentPayload);
+        } catch (e2) {
+          delete currentPayload.is_company;
+          return await odoo.create("res.partner", currentPayload);
+        }
+      }
+      throw e;
+    }
+  };
+
   try {
     vals.company_type = isSoleProp ? "person" : "company";
-    newId = await odoo.create("res.partner", vals);
+    newId = await createWithFallback(vals);
   } catch (e) {
-    if (String(e?.message || "").includes("company_type")) {
-      delete vals.company_type;
-      if (isSoleProp) vals.is_company = false;
-      else vals.is_company = true;
+    const errMsg = String(e?.message || "");
+    let retry = false;
+    
+    if (errMsg.includes("first_name") || errMsg.includes("middle_name") || errMsg.includes("last_name")) {
+      delete vals.first_name;
+      delete vals.middle_name;
+      delete vals.last_name;
+      retry = true;
+    }
+    if (errMsg.includes("commercial_company_name")) {
+      delete vals.commercial_company_name;
+      retry = true;
+    }
+    if (errMsg.includes("branch_code")) {
+      delete vals.branch_code;
+      retry = true;
+    }
+
+    if (retry) {
       try {
-        newId = await odoo.create("res.partner", vals);
-      } catch (_) {
-        delete vals.is_company;
-        newId = await odoo.create("res.partner", vals);
+        newId = await createWithFallback(vals);
+      } catch (e2) {
+        const errMsg2 = String(e2?.message || "");
+        let retry2 = false;
+        if (errMsg2.includes("branch_code")) {
+          delete vals.branch_code;
+          retry2 = true;
+        }
+        if (errMsg2.includes("first_name") || errMsg2.includes("middle_name") || errMsg2.includes("last_name")) {
+          delete vals.first_name;
+          delete vals.middle_name;
+          delete vals.last_name;
+          retry2 = true;
+        }
+        if (retry2) {
+          newId = await createWithFallback(vals);
+        } else {
+          throw e2;
+        }
       }
     } else {
       throw e;
     }
   }
+
   return {
     status: "created", partnerId: Number(newId), created: true, name,
     entityType, tradeName, proprietorName
