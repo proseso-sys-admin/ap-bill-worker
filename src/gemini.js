@@ -234,6 +234,13 @@ CRITICAL PH RECEIPT RULES:
 - Ignore names near keywords: "ATP", "BIR Permit", "Printer", "Accreditation", "Date issued", "O.R. No.", "VAT Reg. TIN" when those appear inside printer/ATP blocks.
 - The vendor is the SELLER/ISSUER (usually top header near "OFFICIAL RECEIPT", "SALES INVOICE", or company address), not the printing company.
 
+TAX & VAT EXTRACTION RULES (CRITICAL):
+- Impact/dot-matrix printers often misalign values on pre-printed forms (e.g., printing the VATable amount on the "VAT Exempt" line).
+- ALWAYS cross-check the math: If Amount A is printed next to "VAT Exempt", and Amount B is next to "Zero Rated" or similar, but mathematically Amount A * 0.12 = Amount B (and A + B = Total), then Amount A is actually the VATable Sales and Amount B is the VAT Amount!
+- Trust the mathematical relationship (Base * 0.12 = VAT, Base + VAT = Total) over the physical alignment of the text on the page. DO NOT assume it's a "mixed tax treatment" if the math perfectly matches a standard 12% VAT calculation.
+- If the math proves it is a VATable transaction with 12% VAT, set vat.classification to "vatable", vat_amount to the 12% portion, and vatable_base to the base amount, completely ignoring the misaligned labels.
+- For line items, if the total invoice is proven to be VATable by the math above, the line items should also be classified with vat_code="vatable" rather than "exempt" or "zero_rated".
+
 VENDOR IDENTITY — SAME BRAND, DIFFERENT LEGAL ENTITIES (CRITICAL):
 - Invoices may mention multiple related names (e.g. "Proseso Consulting", "Proseso Outsourcing Services Inc.", "Proseso Consulting Pte. Ltd."). The vendor for THIS invoice is the legal entity that IS ISSUING this document and receiving payment.
 - PREFER in this order: (1) The exact name in "Account Name" or "Bank Account Name" in the payment/bank details section — that is who gets paid. (2) The company name in the footer or letterhead that appears on every page as the issuer. (3) The name next to the issuer address (e.g. "Proseso Outsourcing Services Inc." above "3rd Floor, ABC Building...").
