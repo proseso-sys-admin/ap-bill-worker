@@ -925,7 +925,7 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
     vals.company_type = "person";
     vals.is_company = false;
     if (tradeName) {
-      vals.commercial_company_name = tradeName;
+      vals.company_name = tradeName;
       notes.push(`Trade name: ${tradeName}`);
     }
     if (typeof details.proprietor_name === "object" && details.proprietor_name !== null) {
@@ -937,7 +937,8 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
     vals.company_type = "company";
     vals.is_company = true;
     if (tradeName && tradeName.toLowerCase() !== name.toLowerCase()) {
-      vals.commercial_company_name = tradeName;
+      vals.name = tradeName; // For companies, if trade name is different, often it's better to use Trade Name as the primary name, but we keep `name` as is and put trade name in comment, or if they want it in a field:
+      // Actually, if it's a company, standard Odoo doesn't have a Trade Name field. We put it in comment.
       notes.push(`DBA: ${tradeName}`);
     }
   }
@@ -970,15 +971,15 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
   } catch (e) {
     const errMsg = String(e?.message || "");
     let retry = false;
-    
+
     if (errMsg.includes("first_name") || errMsg.includes("middle_name") || errMsg.includes("last_name")) {
       delete vals.first_name;
       delete vals.middle_name;
       delete vals.last_name;
       retry = true;
     }
-    if (errMsg.includes("commercial_company_name")) {
-      delete vals.commercial_company_name;
+    if (errMsg.includes("company_name")) {
+      delete vals.company_name;
       retry = true;
     }
     if (errMsg.includes("branch_code")) {
