@@ -2149,15 +2149,80 @@ async function documentsDocumentHasField(odoo, fieldName) {
 }
 
 /**
+ * Temporarily disable the Documents/Accounting auto-document feature on the purchase journal
+ * before creating a bill, to prevent Odoo from auto-generating a duplicate document in the
+ * Purchase folder.  Returns a restore function that re-enables the setting after bill creation.
+ *
+ * In Odoo 19, when a journal has `documents_folder_id` set, every account.move created on that
+ * journal triggers automatic document creation in the journal's folder.  We disable this by
+ * clearing the folder id before create, then restoring it after.
+ */
+async function disableJournalAutoDocument(odoo, companyId, journalId, logger) {
+  if (!journalId) return async () => {};
+
+  // Discover which field controls the auto-document folder on this journal.
+  // Odoo versions use different field names.
+  const candidateFields = [
+    "documents_folder_id",       // Odoo 19 (documents.folder or workspace id)
+    "upload_to_documents",       // Some Odoo versions use a boolean flag
+  ];
+
+  let savedField = null;
+  let savedValue = null;
+
+  for (const field of candidateFields) {
+    try {
+      const rows = await odoo.searchRead(
+        "account.journal",
+        [["id", "=", Number(journalId)]],
+        ["id", field],
+        kwWithCompany(companyId, { limit: 1 })
+      );
+      if (!rows?.[0]) continue;
+      const val = rows[0][field];
+      // m2o field (folder id) — could be [id, name] or just id
+      const resolved = Array.isArray(val) ? val[0] : val;
+      if (resolved) {
+        savedField = field;
+        savedValue = resolved;
+        // Clear the field to disable auto-document creation
+        const clearVal = typeof resolved === "boolean" ? false : false;
+        await odoo.write("account.journal", [Number(journalId)], { [field]: clearVal });
+        if (logger) logger.info("Temporarily disabled journal auto-document.", {
+          journalId, field, savedValue: resolved
+        });
+        break;
+      }
+    } catch (_) {
+      // Field doesn't exist on this Odoo version, try next
+    }
+  }
+
+  // Return a restore function
+  return async () => {
+    if (savedField && savedValue) {
+      try {
+        await odoo.write("account.journal", [Number(journalId)], { [savedField]: savedValue });
+        if (logger) logger.info("Restored journal auto-document setting.", {
+          journalId, field: savedField, value: savedValue
+        });
+      } catch (restoreErr) {
+        if (logger) logger.warn("Failed to restore journal auto-document setting.", {
+          journalId, field: savedField, error: restoreErr?.message
+        });
+      }
+    }
+  };
+}
+
+/**
  * Remove duplicate documents/attachments that Odoo auto-creates when a bill is created.
- * In Odoo 19, the Documents/Accounting bridge creates a mirror document in the purchase
- * journal's folder.  We keep only the original uploaded document (originalDocId) and its
- * attachment (originalAttId), and delete any auto-generated duplicates linked to the bill.
+ * Belt-and-suspenders cleanup in case disableJournalAutoDocument didn't fully prevent
+ * the auto-creation (e.g. company-level setting, or Odoo ignored the cleared field).
  */
 async function removeDuplicateBillDocuments(odoo, companyId, billId, originalDocId, originalAttId, logger) {
   try {
-    // 1. Find documents.document records auto-linked to this bill (res_model=account.move)
-    //    that are NOT our original document.
+    // 1. Find documents.document records auto-linked to this bill that are NOT our original.
     const autoDocsFields = ["id", "name", "attachment_id"];
     let autoDocs = [];
     try {
@@ -2171,8 +2236,36 @@ async function removeDuplicateBillDocuments(odoo, companyId, billId, originalDoc
         autoDocsFields,
         kwWithCompany(companyId, { limit: 20 })
       );
-    } catch (_) {
-      // res_model field may not exist on older versions; safe to skip
+    } catch (_) {}
+
+    // 2. Also search by attachment: Odoo may clone the attachment and link the new document
+    //    to the bill via the attachment's res_model/res_id rather than the document's own fields.
+    if (!autoDocs.length) {
+      try {
+        // Find all attachments on the bill
+        const billAtts = await odoo.searchRead(
+          "ir.attachment",
+          [
+            ["res_model", "=", "account.move"],
+            ["res_id", "=", Number(billId)],
+            ["id", "!=", Number(originalAttId)]
+          ],
+          ["id", "name"],
+          kwWithCompany(companyId, { limit: 20 })
+        );
+        // For each, find any documents.document that references them
+        for (const ba of billAtts) {
+          try {
+            const docs = await odoo.searchRead(
+              "documents.document",
+              [["attachment_id", "=", Number(ba.id)], ["id", "!=", Number(originalDocId)]],
+              autoDocsFields,
+              kwWithCompany(companyId, { limit: 5 })
+            );
+            autoDocs.push(...docs);
+          } catch (_) {}
+        }
+      } catch (_) {}
     }
 
     for (const autoDoc of autoDocs) {
@@ -2189,7 +2282,6 @@ async function removeDuplicateBillDocuments(odoo, companyId, billId, originalDoc
           billId, docId: autoDoc.id, error: unlinkErr?.message
         });
       }
-      // Also remove the auto-created attachment if it's different from the original
       if (autoAttId && autoAttId !== Number(originalAttId)) {
         try {
           await odoo.executeKw("ir.attachment", "unlink", [[autoAttId]], kwWithCompany(companyId));
@@ -2197,7 +2289,7 @@ async function removeDuplicateBillDocuments(odoo, companyId, billId, originalDoc
       }
     }
 
-    // 2. Find ir.attachment records directly linked to the bill that are not our original.
+    // 3. Clean up any remaining ir.attachment records directly linked to the bill.
     const autoAtts = await odoo.searchRead(
       "ir.attachment",
       [
@@ -2209,7 +2301,6 @@ async function removeDuplicateBillDocuments(odoo, companyId, billId, originalDoc
       kwWithCompany(companyId, { limit: 20 })
     );
     for (const dupAtt of autoAtts) {
-      // Only remove attachments that look auto-generated (no processed marker, not from chatter)
       const desc = String(dupAtt.description || "");
       if (desc.includes("BILL_OCR_PROCESSED") || desc.includes("Source: documents.document")) continue;
       try {
@@ -2726,15 +2817,24 @@ async function processOneDocument(args) {
   // account.move creation hooks may try to create a documents.document in the journal's folder.
   await ensureAccountingFolderActive(odoo, companyId, purchaseJournalId, logger, docFolderId);
 
-  // Pass no_document context to prevent Odoo's Documents module from auto-creating
-  // a duplicate document in the purchase journal's accounting folder (Odoo 19).
+  // Temporarily disable the journal's auto-document folder so Odoo doesn't create a
+  // duplicate document in the Purchase folder when the bill is created.
+  const restoreJournalDocFolder = await disableJournalAutoDocument(odoo, companyId, purchaseJournalId, logger);
+
+  // Also pass no_document context as a secondary prevention measure.
   const billCreateCtx = kwWithCompany(companyId, {
     context: { no_document: true }
   });
-  const billId = await odoo.create("account.move", billVals, billCreateCtx);
+  let billId;
+  try {
+    billId = await odoo.create("account.move", billVals, billCreateCtx);
+  } finally {
+    // Always restore the journal setting, even if bill creation fails.
+    await restoreJournalDocFolder();
+  }
 
-  // Clean up any auto-created duplicate documents/attachments linked to this bill
-  // that Odoo may have generated despite the no_document flag.
+  // Belt-and-suspenders: clean up any auto-created duplicate documents/attachments
+  // that Odoo may have generated despite the above preventions.
   await removeDuplicateBillDocuments(odoo, companyId, billId, doc.id, att.id, logger);
 
   await persistDocBillMapping(config, doc.id, billId, targetKey);
