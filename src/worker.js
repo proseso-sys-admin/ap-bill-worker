@@ -287,6 +287,29 @@ async function pickVatTaxesForCompany(odoo, companyId) {
   });
 
   const id = (t) => (t ? Number(t.id) : 0);
+
+  // --- Withholding / EWT tax picking ---
+  const whtTaxes = taxes.filter((t) => isWithholding(t) && t.amount_type === "percent" && Number(t.amount || 0) < 0);
+  const pickWhtByRate = (targetRate) => {
+    const tolerance = 0.5;
+    let best = null;
+    let bestDist = Infinity;
+    for (const t of whtTaxes) {
+      const dist = Math.abs(Number(t.amount) - targetRate);
+      if (dist > tolerance) continue;
+      if (dist < bestDist || (dist === bestDist && norm(t.type_tax_use) === "purchase")) {
+        best = t;
+        bestDist = dist;
+      }
+    }
+    return best;
+  };
+  const ewt1pct = pickWhtByRate(-1);
+  const ewt2pct = pickWhtByRate(-2);
+  const ewt5pct = pickWhtByRate(-5);
+  const ewt10pct = pickWhtByRate(-10);
+  const ewt15pct = pickWhtByRate(-15);
+
   return {
     goodsId: id(goods) || id(generic),
     servicesId: id(services) || id(generic),
@@ -298,6 +321,11 @@ async function pickVatTaxesForCompany(odoo, companyId) {
     exemptImportsId: id(exemptImports),
     zeroRatedId: id(zeroRated),
     genericId: id(generic),
+    ewt1Id: id(ewt1pct),
+    ewt2Id: id(ewt2pct),
+    ewt5Id: id(ewt5pct),
+    ewt10Id: id(ewt10pct),
+    ewt15Id: id(ewt15pct),
     _meta: {
       priceInclude: !!(generic || goods || services)?.price_include,
       amount: Number((generic || goods || services)?.amount || 12)
@@ -445,6 +473,8 @@ async function getTargetsFromOdoo(logger) {
   const g = (key) => (gcsFields[key] != null && String(gcsFields[key]).trim() !== "" ? String(gcsFields[key]).trim() : src[key]);
   const apFolderField = g("sourceGeneralTaskApFolderField");
   const purchaseJournalField = g("sourceGeneralTaskPurchaseJournalField");
+  const countryField = g("sourceGeneralTaskCountryField");
+  const twaField = g("sourceGeneralTaskTwaField");
   const fields = ["id", "project_id", dbField, industryField];
   if (enabledField) fields.push(enabledField);
   if (billWorkerField) fields.push(billWorkerField);
@@ -452,7 +482,7 @@ async function getTargetsFromOdoo(logger) {
   if (companyIdField) fields.push(companyIdField);
   if (emailField) fields.push(emailField);
   if (passwordField) fields.push(passwordField);
-  const accountingFields = [apFolderField, purchaseJournalField].filter(Boolean);
+  const accountingFields = [apFolderField, purchaseJournalField, countryField, twaField].filter(Boolean);
   accountingFields.forEach((f) => {
     if (!fields.includes(f)) fields.push(f);
   });
@@ -540,7 +570,11 @@ async function getTargetsFromOdoo(logger) {
       apFolderId: accounting.apFolderId,
       apFolderParent: accounting.apFolderParent || "",
       purchaseJournalId: accounting.purchaseJournalId,
-      industry
+      industry,
+      country: countryField && task[countryField] != null
+        ? (Array.isArray(task[countryField]) ? String(task[countryField][1] || task[countryField][0] || "").trim() : String(task[countryField] || "").trim())
+        : "",
+      isTopWithholdingAgent: twaField ? toBool(task[twaField]) : false
     });
   }
   logger.info("getTargetsFromOdoo: loaded targets from General tasks.", { count: targets.length });
@@ -574,7 +608,9 @@ function groupRoutingRows(rows) {
         apFolderId: row.ap_folder_id || 0,
         apFolderParent: row.ap_folder_parent || "",
         purchaseJournalId: row.purchase_journal_id || 0,
-        industry: String(row.industry || "").trim()
+        industry: String(row.industry || "").trim(),
+        country: String(row.country || "").trim(),
+        isTopWithholdingAgent: false
       });
     }
   }
@@ -1114,6 +1150,43 @@ function pickLineTaxIds(taxMap, lineItem, billGoodsOrServices, vendorCountry, ex
   if (cat && /office_supplies|inventory|fuel|meals/.test(cat) && taxMap.goodsId) return [taxMap.goodsId];
 
   return taxMap.genericId ? [taxMap.genericId] : [];
+}
+
+/**
+ * Determines which EWT (Expanded Withholding Tax) ID applies to a bill line.
+ * Returns 0 if no EWT applies.
+ *
+ * BIR RR 11-2018 rates:
+ *  - TWA: 1% goods, 2% services (all purchases)
+ *  - Non-TWA specific categories:
+ *      professional_fees → 10%, rent → 5%, repairs/contractors → 2%,
+ *      freight → 2%, commission → 10%
+ */
+function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags) {
+  const { country, isTopWithholdingAgent } = entityFlags || {};
+
+  // Only PH entities get EWT
+  if (country && !/philipp|^ph$/i.test(country)) return 0;
+
+  const cat = String(expenseCategory || "").toLowerCase();
+  const gs = String(goodsOrServices || "").toLowerCase();
+
+  if (isTopWithholdingAgent) {
+    // TWA: 1% on goods, 2% on services
+    if (gs === "goods") return taxMap.ewt1Id || 0;
+    if (gs === "services") return taxMap.ewt2Id || 0;
+    // Default to 2% for unknown (services is more common in AP)
+    return taxMap.ewt2Id || taxMap.ewt1Id || 0;
+  }
+
+  // Non-TWA: only specific categories per BIR RR 11-2018
+  if (cat === "professional_fees") return taxMap.ewt10Id || taxMap.ewt15Id || 0;
+  if (cat === "rent") return taxMap.ewt5Id || 0;
+  if (cat === "repairs") return taxMap.ewt2Id || 0;
+  if (cat === "freight") return taxMap.ewt2Id || 0;
+  if (/commission/i.test(cat)) return taxMap.ewt10Id || 0;
+
+  return 0;
 }
 
 async function getTaxMeta(odoo, companyId, taxIds) {
@@ -1817,7 +1890,7 @@ function vendorNameAccountHint(vendorName, expenseAccounts) {
   return 0;
 }
 
-function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, purchaseJournalId, currencyId, taxMeta, lineAccountIds, vendorCountry) {
+function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, purchaseJournalId, currencyId, taxMeta, lineAccountIds, vendorCountry, entityFlags) {
   const inv = extracted?.invoice || {};
   const totals = extracted?.totals || {};
   const grandTotal = Number(totals.grand_total || 0);
@@ -1855,6 +1928,14 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
       } else {
         lineTaxIds = billLevelTaxIds;
       }
+
+      // Append EWT (withholding tax) if applicable
+      const lineGs = String(item.goods_or_services || billGs || "").toLowerCase();
+      const ewtId = pickEwtTaxId(taxMap, item.expense_category, lineGs, entityFlags);
+      if (ewtId && !lineTaxIds.includes(ewtId)) {
+        lineTaxIds = [...lineTaxIds, ewtId];
+      }
+
       const lineHasTax = lineTaxIds.length > 0 && lineVatCode !== "no_vat";
 
       const itemVatInclusive = lineHasTax && (globalVatInclusive || (item.unit_price_includes_vat ?? false));
@@ -1918,7 +1999,14 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
     };
     const acctId = lineAccountIds?.[0] || 0;
     if (acctId) line.account_id = acctId;
-    if (billLevelTaxIds.length) line.tax_ids = [[6, 0, billLevelTaxIds]];
+    // Append EWT for single-line bills
+    const hint = extracted?.expense_account_hint || {};
+    const singleCat = lineItems[0]?.expense_category || hint.category || "other";
+    const singleGs = String(extracted?.vat?.goods_or_services || "").toLowerCase();
+    const singleEwtId = pickEwtTaxId(taxMap, singleCat, singleGs, entityFlags);
+    let singleTaxIds = [...billLevelTaxIds];
+    if (singleEwtId && !singleTaxIds.includes(singleEwtId)) singleTaxIds.push(singleEwtId);
+    if (singleTaxIds.length) line.tax_ids = [[6, 0, singleTaxIds]];
     else line.tax_ids = [[5, 0, 0]]; // Explicitly clear taxes to prevent Odoo from applying account defaults
     invoiceLines.push([0, 0, line]);
   }
@@ -2141,7 +2229,8 @@ async function processOneDocument(args) {
     force = false,
     apFolderId: argApFolderId = 0,
     useIsFolder: argUseIsFolder = false,
-    userHint = ""
+    userHint = "",
+    entityFlags = {}
   } = args;
   const attachmentId = m2oId(doc.attachment_id);
   if (!attachmentId) return { status: "skip", reason: "no_attachment" };
@@ -2426,7 +2515,8 @@ async function processOneDocument(args) {
     currencyId,
     taxMeta,
     lineAccountIds,
-    vendorCountry
+    vendorCountry,
+    entityFlags
   );
   
   // Move document to active AP folder if currently archived
@@ -2553,6 +2643,32 @@ async function processOneDocument(args) {
     );
   }
 
+  // EWT (withholding tax) chatter notification
+  {
+    const ewtCountry = String(entityFlags?.country || "").trim();
+    const isPHEntity = !ewtCountry || /philipp|^ph$/i.test(ewtCountry);
+    if (isPHEntity) {
+      const hasAnyEwt = taxMap.ewt1Id || taxMap.ewt2Id || taxMap.ewt5Id || taxMap.ewt10Id || taxMap.ewt15Id;
+      const isTwa = !!entityFlags?.isTopWithholdingAgent;
+      if (!hasAnyEwt) {
+        await safeMessagePost(
+          odoo, companyId, "account.move", Number(billId),
+          `<b>⚠️ Withholding tax notice:</b> No EWT tax records found in the database. ` +
+          `Please create the appropriate withholding tax records (e.g., EWT 1%, 2%, 5%, 10%) ` +
+          `and the system will automatically apply them on future bills.` +
+          (isTwa ? ` This entity is a Top Withholding Agent — all purchases require EWT.` : ``)
+        );
+      } else if (isTwa) {
+        const rateApplied = taxMap.ewt2Id ? "2%" : (taxMap.ewt1Id ? "1%" : "N/A");
+        await safeMessagePost(
+          odoo, companyId, "account.move", Number(billId),
+          `<b>🏛️ EWT applied</b> — Entity is a Top Withholding Agent (TWA). ` +
+          `Expanded withholding tax applied on bill lines per BIR RR 11-2018.`
+        );
+      }
+    }
+  }
+
   const feedbackCount = Number(geminiAssignments?._feedbackCount || 0);
   const vendorMemoryLines = lineAccountSources
     .map((s, i) => (s === "vendor_memory" ? i + 1 : null))
@@ -2659,7 +2775,11 @@ async function processTargetGroup(target, startMs, logger) {
         purchaseJournalId: target.purchaseJournalId,
         industry: target.industry,
         apFolderId,
-        useIsFolder
+        useIsFolder,
+        entityFlags: {
+          country: target.country || "",
+          isTopWithholdingAgent: !!target.isTopWithholdingAgent
+        }
       });
       if (result.status === "ok") stats.created += 1;
       else stats.skipped += 1;
@@ -2788,7 +2908,11 @@ async function runOne({ logger, payload = {} }) {
     force: isForce,
     apFolderId,
     useIsFolder,
-    userHint
+    userHint,
+    entityFlags: {
+      country: target.country || "",
+      isTopWithholdingAgent: !!target.isTopWithholdingAgent
+    }
   });
 
   return {
