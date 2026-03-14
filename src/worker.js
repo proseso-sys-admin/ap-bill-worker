@@ -1208,16 +1208,25 @@ function ewtIdByRate(taxMap, rate, vendorIsIndividual) {
 function isVendorIndividual(extracted) {
   const et = String(extracted?.vendor_details?.entity_type || "").toLowerCase();
   if (et === "individual" || et === "sole_proprietor") return true;
-  if (et === "corporation" || et === "general_professional_partnership") return false;
+  if (et === "corporation" || et === "general_professional_partnership"
+    || et === "non_profit_organization" || et === "cooperative"
+    || et === "government_entity") return false;
   return undefined; // unknown — caller decides default
 }
 
 /**
- * General Professional Partnerships (GPPs) are pass-through entities exempt from
- * income tax under Philippine law — payments to GPPs are NOT subject to EWT.
+ * Certain entity types are exempt from Expanded Withholding Tax (EWT):
+ * - General Professional Partnerships (GPPs): pass-through entities exempt from income tax
+ * - Non-profit organizations: exempt under NIRC Sec. 30
+ * - Cooperatives: exempt from income tax under the Cooperative Code
+ * - Government entities: exempt from EWT
  */
-function isVendorGPP(extracted) {
-  return String(extracted?.vendor_details?.entity_type || "").toLowerCase() === "general_professional_partnership";
+function isVendorEwtExempt(extracted) {
+  const et = String(extracted?.vendor_details?.entity_type || "").toLowerCase();
+  return et === "general_professional_partnership"
+      || et === "non_profit_organization"
+      || et === "cooperative"
+      || et === "government_entity";
 }
 
 /**
@@ -1250,8 +1259,8 @@ function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, ext
     if (vendorCountry && !/philipp|^ph$/i.test(vendorCountry)) return 0;
   }
 
-  // GPPs are exempt from income tax — not subject to EWT
-  if (isVendorGPP(extracted)) return 0;
+  // GPPs, non-profits, cooperatives, and government entities are exempt from EWT
+  if (isVendorEwtExempt(extracted)) return 0;
 
   const vendorIndiv = isVendorIndividual(extracted);
 
@@ -2888,6 +2897,10 @@ async function processOneDocument(args) {
     const entityLabel = et === "sole_proprietor" ? "Sole Proprietor"
       : et === "corporation" ? "Corporation"
       : et === "individual" ? "Individual"
+      : et === "general_professional_partnership" ? "General Professional Partnership"
+      : et === "non_profit_organization" ? "Non-Profit Organization"
+      : et === "cooperative" ? "Cooperative"
+      : et === "government_entity" ? "Government Entity"
       : "Unknown";
     const tn = String(vd.trade_name || vendor.tradeName || "").trim();
     const pn = String(vd.proprietor_name || vendor.proprietorName || "").trim();
@@ -2954,12 +2967,24 @@ async function processOneDocument(args) {
     const ewtCountry = String(entityFlags?.country || "").trim();
     const isPHEntity = !ewtCountry || /philipp|^ph$/i.test(ewtCountry);
     if (isPHEntity) {
-      const vendorGPP = isVendorGPP(extracted);
-      if (vendorGPP) {
+      const vendorExempt = isVendorEwtExempt(extracted);
+      if (vendorExempt) {
+        const exemptEt = String(extracted?.vendor_details?.entity_type || "").toLowerCase();
+        const exemptLabel = exemptEt === "general_professional_partnership" ? "General Professional Partnership (GPP)"
+          : exemptEt === "non_profit_organization" ? "Non-Profit Organization"
+          : exemptEt === "cooperative" ? "Cooperative"
+          : exemptEt === "government_entity" ? "Government Entity"
+          : exemptEt;
+        const exemptReason = exemptEt === "general_professional_partnership"
+          ? "GPPs are pass-through entities exempt from income tax; payments are not subject to EWT."
+          : exemptEt === "non_profit_organization"
+          ? "Non-profit organizations are exempt from income tax under NIRC Sec. 30; payments are not subject to EWT."
+          : exemptEt === "cooperative"
+          ? "Cooperatives are exempt from income tax under the Cooperative Code; payments are not subject to EWT."
+          : "Government entities are exempt from EWT.";
         await safeMessagePost(
           odoo, companyId, "account.move", Number(billId),
-          `<b>🏛️ EWT exempt</b> — Vendor classified as General Professional Partnership (GPP). ` +
-          `GPPs are pass-through entities exempt from income tax; payments are not subject to EWT.`
+          `<b>🏛️ EWT exempt</b> — Vendor classified as ${exemptLabel}. ${exemptReason}`
         );
       }
       const ewtMap = taxMap.ewt || {};
@@ -2971,7 +2996,7 @@ async function processOneDocument(args) {
       if (isTwa) ewtParts.push("Entity is a Top Withholding Agent (TWA)");
       const vendorIndiv = isVendorIndividual(extracted);
       if (vendorIndiv === true) ewtParts.push("Vendor: individual/sole proprietor (WI codes)");
-      else if (vendorIndiv === false && !vendorGPP) ewtParts.push("Vendor: corporation/juridical (WC codes)");
+      else if (vendorIndiv === false && !vendorExempt) ewtParts.push("Vendor: corporation/juridical (WC codes)");
       if (invoiceEwtDetected) {
         const detailParts = [];
         if (wht.ewt_rate) detailParts.push(`rate: ${wht.ewt_rate}%`);
