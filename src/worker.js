@@ -1693,13 +1693,18 @@ function lineItemsTotalMatchesInvoice(lineItems, grandTotal, netTotal) {
   if (!lineItems.length) return false;
   const lineSum = lineItems.reduce((s, li) => s + Number(li.amount || 0), 0);
   if (!lineSum) return false;
-  if (grandTotal > 0) {
-    const diffGrand = Math.abs(lineSum - grandTotal) / grandTotal;
-    if (diffGrand < 0.05) return true;
-  }
+  // When both net and grand totals exist, line item amounts should match the net/vatable
+  // total (pre-tax).  Comparing against grand total is misleading because the tax gap makes
+  // a wrong lineSum appear close to grand total (e.g. 4785 vs 4885 = 2% but net is 4361).
+  // Use 2% tolerance — anything larger indicates wrong quantities or amounts.
+  const TOL = 0.02;
   if (netTotal > 0 && netTotal !== grandTotal) {
     const diffNet = Math.abs(lineSum - netTotal) / netTotal;
-    if (diffNet < 0.05) return true;
+    if (diffNet < TOL) return true;
+  }
+  if (grandTotal > 0) {
+    const diffGrand = Math.abs(lineSum - grandTotal) / grandTotal;
+    if (diffGrand < TOL) return true;
   }
   return false;
 }
@@ -2062,7 +2067,7 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
       invoiceLines.push([0, 0, line]);
     }
 
-    if (!hasPerLineVat && expectedUntaxed > 0 && invoiceLines.length > 0) {
+    if (expectedUntaxed > 0 && invoiceLines.length > 0) {
       const lineUntaxedSum = invoiceLines.reduce((s, entry) => {
         const l = entry[2];
         const disc = Number(l.discount || 0) / 100;
