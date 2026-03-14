@@ -95,7 +95,7 @@ const extractionSchema = {
             country: { type: "string", description: "Country name" }
           }
         },
-        entity_type: { type: "string", description: "corporation|sole_proprietor|individual|general_professional_partnership|unknown" },
+        entity_type: { type: "string", description: "corporation|sole_proprietor|individual|general_professional_partnership|non_profit_organization|cooperative|government_entity|unknown" },
         trade_name: { type: "string", description: "Business/trade name (DBA). For sole proprietors this is the shop/store name that differs from the owner's personal name" },
         proprietor_name: {
           type: "object",
@@ -310,6 +310,9 @@ VENDOR DETAIL REQUIREMENTS (PH):
   - "sole_proprietor" if there is BOTH a trade/business name AND a personal owner name (e.g. "Prop.", "Owner:", or a personal name under/near a business name)
   - "individual" if the vendor is clearly a person with no business name
   - "general_professional_partnership" (GPP) if the vendor is a partnership of licensed professionals (law firms, CPA firms, medical/dental partnerships). Look for: "& Associates", "& Partners", "& Co.", "Law Offices", "Law Firm", "CPA", "CPAs", "Attorneys", or multiple partner names listed. GPPs are exempt from income tax (pass-through to partners) and NOT subject to EWT.
+  - "non_profit_organization" if the vendor is a non-stock, non-profit entity. Look for: "Chamber of Commerce", "Foundation", "Association", "Federation", "Society", or entities clearly organized as non-profit under NIRC Sec. 30. These are exempt from income tax and NOT subject to EWT.
+  - "cooperative" if the vendor is a registered cooperative. Look for: "Cooperative", "Coop", "Multi-Purpose Cooperative", "MPC". Cooperatives are exempt from income tax and NOT subject to EWT.
+  - "government_entity" if the vendor is a government agency, LGU, or GOCC. Look for: "City of", "Municipality of", "Province of", "Department of", "Bureau of", "National", "Republic of the Philippines", "Barangay". Government entities are exempt from EWT.
   - "unknown" if you cannot determine
 - vendor_details.trade_name: the business/trade name (DBA). For sole proprietors, this is the shop name (e.g. "JORJEL LAUNDRY SHOP"). For corporations, same as vendor.name. Empty if not applicable.
 - vendor_details.proprietor_name: the owner/proprietor's personal name if entity is sole_proprietor. Look for keywords like "Prop.", "Owner", "Proprietor", or a personal name printed below/near the business name. Empty string if not a sole proprietor or not found.
@@ -320,6 +323,10 @@ VENDOR DETAIL REQUIREMENTS (PH):
   - "REYES & SANTOS LAW OFFICES" → entity_type="general_professional_partnership"
   - "CRUZ, GARCIA & ASSOCIATES, CPAs" → entity_type="general_professional_partnership"
   - "DELA CRUZ ACCOUNTING FIRM" (single CPA with staff, Inc.) → entity_type="corporation" (NOT GPP — it's incorporated)
+  - "PHILIPPINE CHAMBER OF COMMERCE AND INDUSTRY" → entity_type="non_profit_organization"
+  - "QUEZON CITY COOPERATIVE" → entity_type="cooperative"
+  - "CITY OF MAKATI" → entity_type="government_entity"
+  - "DEPARTMENT OF PUBLIC WORKS AND HIGHWAYS" → entity_type="government_entity"
 
 PH VAT RULES (IMPORTANT):
 - Decide vat.classification (BILL LEVEL — if ANY line has VAT, classification should be "vatable"):
