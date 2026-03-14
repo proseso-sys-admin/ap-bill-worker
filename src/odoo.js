@@ -71,8 +71,8 @@ class OdooClient {
     return this.executeKw(model, "search", [domain], kwargs);
   }
 
-  async create(model, vals) {
-    return this.executeKw(model, "create", [vals], {});
+  async create(model, vals, kwargs = {}) {
+    return this.executeKw(model, "create", [vals], kwargs);
   }
 
   async write(model, ids, vals) {

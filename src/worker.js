@@ -2148,6 +2148,84 @@ async function documentsDocumentHasField(odoo, fieldName) {
   }
 }
 
+/**
+ * Remove duplicate documents/attachments that Odoo auto-creates when a bill is created.
+ * In Odoo 19, the Documents/Accounting bridge creates a mirror document in the purchase
+ * journal's folder.  We keep only the original uploaded document (originalDocId) and its
+ * attachment (originalAttId), and delete any auto-generated duplicates linked to the bill.
+ */
+async function removeDuplicateBillDocuments(odoo, companyId, billId, originalDocId, originalAttId, logger) {
+  try {
+    // 1. Find documents.document records auto-linked to this bill (res_model=account.move)
+    //    that are NOT our original document.
+    const autoDocsFields = ["id", "name", "attachment_id"];
+    let autoDocs = [];
+    try {
+      autoDocs = await odoo.searchRead(
+        "documents.document",
+        [
+          ["res_model", "=", "account.move"],
+          ["res_id", "=", Number(billId)],
+          ["id", "!=", Number(originalDocId)]
+        ],
+        autoDocsFields,
+        kwWithCompany(companyId, { limit: 20 })
+      );
+    } catch (_) {
+      // res_model field may not exist on older versions; safe to skip
+    }
+
+    for (const autoDoc of autoDocs) {
+      const autoAttId = autoDoc.attachment_id
+        ? (Array.isArray(autoDoc.attachment_id) ? Number(autoDoc.attachment_id[0]) : Number(autoDoc.attachment_id))
+        : 0;
+      try {
+        await odoo.executeKw("documents.document", "unlink", [[Number(autoDoc.id)]], kwWithCompany(companyId));
+        if (logger) logger.info("Removed auto-created duplicate document.", {
+          billId, removedDocId: autoDoc.id, removedDocName: autoDoc.name, originalDocId
+        });
+      } catch (unlinkErr) {
+        if (logger) logger.warn("Failed to remove auto-created duplicate document.", {
+          billId, docId: autoDoc.id, error: unlinkErr?.message
+        });
+      }
+      // Also remove the auto-created attachment if it's different from the original
+      if (autoAttId && autoAttId !== Number(originalAttId)) {
+        try {
+          await odoo.executeKw("ir.attachment", "unlink", [[autoAttId]], kwWithCompany(companyId));
+        } catch (_) {}
+      }
+    }
+
+    // 2. Find ir.attachment records directly linked to the bill that are not our original.
+    const autoAtts = await odoo.searchRead(
+      "ir.attachment",
+      [
+        ["res_model", "=", "account.move"],
+        ["res_id", "=", Number(billId)],
+        ["id", "!=", Number(originalAttId)]
+      ],
+      ["id", "name", "description"],
+      kwWithCompany(companyId, { limit: 20 })
+    );
+    for (const dupAtt of autoAtts) {
+      // Only remove attachments that look auto-generated (no processed marker, not from chatter)
+      const desc = String(dupAtt.description || "");
+      if (desc.includes("BILL_OCR_PROCESSED") || desc.includes("Source: documents.document")) continue;
+      try {
+        await odoo.executeKw("ir.attachment", "unlink", [[Number(dupAtt.id)]], kwWithCompany(companyId));
+        if (logger) logger.info("Removed auto-created duplicate attachment.", {
+          billId, removedAttId: dupAtt.id, removedAttName: dupAtt.name, originalAttId
+        });
+      } catch (_) {}
+    }
+  } catch (err) {
+    if (logger) logger.warn("removeDuplicateBillDocuments failed (non-fatal).", {
+      billId, originalDocId, error: err?.message || String(err)
+    });
+  }
+}
+
 async function attachFileToBillChatter(odoo, companyId, att, billId, docId) {
   if (!att?.datas) return;
   try {
@@ -2648,7 +2726,17 @@ async function processOneDocument(args) {
   // account.move creation hooks may try to create a documents.document in the journal's folder.
   await ensureAccountingFolderActive(odoo, companyId, purchaseJournalId, logger, docFolderId);
 
-  const billId = await odoo.create("account.move", billVals);
+  // Pass no_document context to prevent Odoo's Documents module from auto-creating
+  // a duplicate document in the purchase journal's accounting folder (Odoo 19).
+  const billCreateCtx = kwWithCompany(companyId, {
+    context: { no_document: true }
+  });
+  const billId = await odoo.create("account.move", billVals, billCreateCtx);
+
+  // Clean up any auto-created duplicate documents/attachments linked to this bill
+  // that Odoo may have generated despite the no_document flag.
+  await removeDuplicateBillDocuments(odoo, companyId, billId, doc.id, att.id, logger);
+
   await persistDocBillMapping(config, doc.id, billId, targetKey);
   const marker = makeProcessedMarker(
     config.scan.processedMarkerPrefix,
@@ -2660,7 +2748,8 @@ async function processOneDocument(args) {
   await odoo.write("ir.attachment", [att.id], {
     description: appendMarker(att.description, marker)
   });
-  await attachFileToBillChatter(odoo, companyId, att, Number(billId), Number(doc.id));
+  // Skip attachFileToBillChatter — the original document is linked to the bill via
+  // linkDocumentToBill below. Creating a chatter attachment duplicates the file.
   try {
     await linkDocumentToBill(odoo, companyId, Number(doc.id), Number(billId), logger, argApFolderId, argUseIsFolder, purchaseJournalId);
   } catch (linkErr) {
