@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "odoo-connect": {
+      "type": "sse",
+      "url": "https://odoo-mcp-server-njiacix2yq-as.a.run.app/sse"
+    }
+  }
+}
