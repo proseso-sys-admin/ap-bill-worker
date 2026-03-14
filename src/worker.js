@@ -637,13 +637,19 @@ async function resolveApFolderId(odoo, companyId, opts = {}) {
   const parentFolderName = String(opts.parentFolderName || "").trim();
   const names = ["Accounts Payable", "Account Payables", "AP", "Vendor Bills"];
 
+  let isFolderDomain = ["is_folder", "=", true];
+  try {
+    const hasType = await documentsDocumentHasField(odoo, "type");
+    if (hasType) isFolderDomain = ["type", "=", "folder"];
+  } catch (_) {}
+
   // If parent specified (e.g. "Accounting"), resolve root folder with that name first
   let parentId = null;
   if (parentFolderName) {
     try {
       const parents = await odoo.searchRead(
         "documents.document",
-        [["is_folder", "=", true], ["name", "=", parentFolderName], ["folder_id", "=", false]],
+        [isFolderDomain, ["name", "=", parentFolderName], ["folder_id", "=", false]],
         ["id"],
         kwWithCompany(companyId, { limit: 1 })
       );
@@ -665,12 +671,12 @@ async function resolveApFolderId(odoo, companyId, opts = {}) {
 
   const folderIdDomain = parentId != null ? [["folder_id", "=", parentId]] : [];
 
-  // Odoo 19: folders are documents.document with is_folder=true
+  // Odoo 19 / Odoo 18
   try {
     for (const name of names) {
       const folders = await odoo.searchRead(
         "documents.document",
-        [["is_folder", "=", true], ["name", "=", name], ...folderIdDomain],
+        [isFolderDomain, ["name", "=", name], ...folderIdDomain],
         ["id", "name", "company_id"],
         kwWithCompany(companyId, { limit: 1 })
       );
@@ -714,11 +720,15 @@ async function resolveSubfolderIds(odoo, companyId, rootFolderId, useIsFolder) {
   const ids = [rootFolderId];
   if (!useIsFolder) return ids;
   try {
+    let isFolderDomain = ["is_folder", "=", true];
+    const hasType = await documentsDocumentHasField(odoo, "type");
+    if (hasType) isFolderDomain = ["type", "=", "folder"];
+
     let frontier = [rootFolderId];
     for (let depth = 0; depth < 5 && frontier.length; depth++) {
       const children = await odoo.searchRead(
         "documents.document",
-        [["is_folder", "=", true], ["folder_id", "in", frontier]],
+        [isFolderDomain, ["folder_id", "in", frontier]],
         ["id"],
         kwWithCompany(companyId, { limit: 200 })
       );
@@ -741,7 +751,13 @@ async function listCandidateDocuments(odoo, companyId, apFolderId, useIsFolder =
     ? [["folder_id", "=", folderIds[0]]]
     : [["folder_id", "in", folderIds]];
   const baseFields = ["id", "name", "attachment_id", "folder_id", "company_id", "create_date", "res_model", "res_id"];
-  const isFolderCond = useIsFolder ? [["is_folder", "=", false]] : [];
+  
+  let isNotFolderDomain = ["is_folder", "=", false];
+  try {
+    const hasType = await documentsDocumentHasField(odoo, "type");
+    if (hasType) isNotFolderDomain = ["type", "!=", "folder"];
+  } catch (_) {}
+  const isFolderCond = useIsFolder ? [isNotFolderDomain] : [];
 
   const pass1Domain = [
     ...folderCond,
@@ -2188,7 +2204,7 @@ async function ensureAccountingFolderActive(odoo, companyId, journalId, logger, 
   const folderIds = new Set();
   if (additionalFolderId) folderIds.add(Number(additionalFolderId));
 
-  for (const field of ["documents_account_folder_id"]) {
+  for (const field of ["documents_account_folder_id", "account_folder_id"]) {
     try {
       const rows = await odoo.searchRead(
         "res.company", [["id", "=", companyId]], ["id", field], { limit: 1 }
@@ -2214,11 +2230,15 @@ async function ensureAccountingFolderActive(odoo, companyId, journalId, logger, 
     const acctNames = /^(finance|accounting|vendor.bill|bills|factur)/i;
     for (const model of ["documents.document", "documents.folder"]) {
       try {
+        let domain = [["active", "=", false]];
+        if (model === "documents.document") {
+          const hasType = await documentsDocumentHasField(odoo, "type");
+          if (hasType) domain.push(["type", "=", "folder"]);
+          else domain.push(["is_folder", "=", true]);
+        }
         const rows = await odoo.searchRead(
           model,
-          model === "documents.document"
-            ? [["is_folder", "=", true], ["active", "=", false]]
-            : [["active", "=", false]],
+          domain,
           ["id", "name"],
           kwWithCompany(companyId, { limit: 50 })
         );
@@ -3076,7 +3096,14 @@ async function listApDocuments({ logger, payload = {} }) {
     ...folderCond,
     ["attachment_id", "!=", false]
   ];
-  if (useIsFolder) docDomain.push(["is_folder", "=", false]);
+  if (useIsFolder) {
+    let isNotFolderDomain = ["is_folder", "=", false];
+    try {
+      const hasType = await documentsDocumentHasField(odoo, "type");
+      if (hasType) isNotFolderDomain = ["type", "!=", "folder"];
+    } catch (_) {}
+    docDomain.push(isNotFolderDomain);
+  }
   const allDocs = await odoo.searchRead(
     "documents.document",
     docDomain,

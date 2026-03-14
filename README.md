@@ -251,10 +251,10 @@ In the **Send Webhook Notification** action form:
 
 | Odoo 19 field | Value to set |
 |----------------|--------------|
-| **URL** | Your worker base URL + `/webhook/document-upload`. Example: `https://ap-bill-ocr-worker-xxxxx.run.app/webhook/document-upload`. No trailing slash. |
-| **Fields** | Select at least **ID** (so the payload includes the document’s database ID). The worker accepts the ID in the body as `doc_id`, `document_id`, or `id`. If your UI lets you set a custom body instead of **Fields**, use: `{"doc_id": {{ record.id }}}` or `{"id": {{ record.id }}}`. To send the secret in the body (when headers are not available), use: `{"doc_id": {{ record.id }}, "worker_secret": "<same value as WORKER_SHARED_SECRET in your .env>"}`. |
-| **Sample Payload** | Use this to confirm the request body includes the document ID (as `id`, `doc_id`, or `document_id`). |
-| **Headers** (if the form has this) | Add header name `x-worker-secret`, value = the same string as `WORKER_SHARED_SECRET` in your worker `.env`. |
+| **URL** | Your worker base URL + `/webhook/document-upload?worker_secret=Papaya3562`. Example: `https://ap-bill-ocr-worker-xxxxx.run.app/webhook/document-upload?worker_secret=Papaya3562`. |
+| **Fields** | Select **ID**. |
+| **Sample Payload** | Use this to confirm the request body includes the document ID (as `id`). |
+| **Headers** (if the form has this) | (Optional since it is in the URL query parameters) Add header name `x-worker-secret`, value = the same string as `WORKER_SHARED_SECRET` in your worker `.env`. |
 
 Click **Save & Close** (or **Save & New** to add another action).
 
@@ -271,10 +271,10 @@ Click **Save & Close** (or **Save & New** to add another action).
 
 | Odoo 19 field | Value to set |
 |----------------|--------------|
-| **URL** | Your worker base URL + `/webhook/document-delete`. Example: `https://ap-bill-ocr-worker-xxxxx.run.app/webhook/document-delete`. No trailing slash. |
-| **Fields** | Select **ID** so the payload includes the document ID. The worker accepts `doc_id`, `document_id`, or `id` in the body. If you use a custom body: `{"doc_id": {{ record.id }}}` or `{"id": {{ record.id }}}`, or with secret: `{"doc_id": {{ record.id }}, "worker_secret": "<same value as WORKER_SHARED_SECRET in your .env>"}`. |
-| **Sample Payload** | Check that the body contains the document ID. |
-| **Headers** (if the form has this) | Add header name `x-worker-secret`, value = the same string as `WORKER_SHARED_SECRET` in your worker `.env`. |
+| **URL** | Your worker base URL + `/webhook/document-delete?worker_secret=Papaya3562`. Example: `https://ap-bill-ocr-worker-xxxxx.run.app/webhook/document-delete?worker_secret=Papaya3562`. |
+| **Fields** | Select **ID**. |
+| **Sample Payload** | Check that the body contains the document ID (as `id`). |
+| **Headers** (if the form has this) | (Optional since it is in the URL query parameters) Add header name `x-worker-secret`, value = the same string as `WORKER_SHARED_SECRET` in your worker `.env`. |
 
 Click **Save & Close**.
 
@@ -285,22 +285,24 @@ Click **Save & Close**.
 If you use the Bank Statement parser, you need to set up three additional webhooks on the `documents.document` model.
 
 **Bank Statement Upload:**
+* **Model:** **Document** (`documents.document`)
 * **Trigger:** On create (or On create and edit)
-* **URL:** Your worker base URL + `/webhook/bs-document-upload`
-* **Body/Fields:** Must include `doc_id` (record ID). Optionally pass `worker_secret` using a custom body.
+* **URL:** Your worker base URL + `/webhook/bs-document-upload?worker_secret=Papaya3562`
+* **Body/Fields:** Select **ID**.
 * **Domain:** Optional, but recommended to restrict to your bank statement folder (`[('folder_id.name', 'ilike', 'bank')]`).
 
 **Bank Statement Delete:**
+* **Model:** **Document** (`documents.document`)
 * **Trigger:** On deletion
-* **URL:** Your worker base URL + `/webhook/bs-document-delete`
-* **Body/Fields:** Must include `doc_id` (record ID).
+* **URL:** Your worker base URL + `/webhook/bs-document-delete?worker_secret=Papaya3562`
+* **Body/Fields:** Select **ID**.
 
-**Bank Statement Chatter Message (for @bot retry):**
+**Bank Statement Chatter Message (for @bot, @ocr, @worker, or @ai retry):**
 * **Model:** **Message** (`mail.message`)
 * **Trigger:** On create
-* **Apply on (Domain):** `[('model', '=', 'documents.document'), ('body', 'ilike', '@bot')]`
-* **URL:** Your worker base URL + `/webhook/bs-chatter-message`
-* **Body/Fields:** Send a custom body: `{"doc_id": {{ record.res_id }}, "message_body": "{{ record.body }}"}` (add `worker_secret` if needed).
+* **Apply on (Domain):** `['&', ('model', '=', 'documents.document'), '|', '|', '|', ('body', 'ilike', '@bot'), ('body', 'ilike', '@ocr'), ('body', 'ilike', '@worker'), ('body', 'ilike', '@ai')]`
+* **URL:** Your worker base URL + `/webhook/bs-chatter-message?worker_secret=Papaya3562`
+* **Body/Fields:** Select **ID**, **Record ID** (`res_id`), and **Contents** (`body`).
 
 ---
 
@@ -308,14 +310,14 @@ If you use the Bank Statement parser, you need to set up three additional webhoo
 
 You can also allow users to talk to the AI for AP Bills by mentioning `@bot` in the document chatter.
 
-**AP Bill Chatter Message (for @bot retry):**
+**AP Bill Chatter Message (for @bot, @ocr, @worker, or @ai retry):**
 * **Model:** **Message** (`mail.message`)
 * **Trigger:** On create
-* **Apply on (Domain):** `[('model', '=', 'documents.document'), ('body', 'ilike', '@bot')]`
-* **URL:** Your worker base URL + `/webhook/chatter-message`
-* **Body/Fields:** Send a custom body: `{"doc_id": {{ record.res_id }}, "message_body": "{{ record.body }}"}` (add `worker_secret` if needed).
+* **Apply on (Domain):** `['&', ('model', '=', 'documents.document'), '|', '|', '|', ('body', 'ilike', '@bot'), ('body', 'ilike', '@ocr'), ('body', 'ilike', '@worker'), ('body', 'ilike', '@ai')]`
+* **URL:** Your worker base URL + `/webhook/chatter-message?worker_secret=Papaya3562`
+* **Body/Fields:** Select **ID**, **Record ID** (`res_id`), and **Contents** (`body`).
 
-Once set up, a user can type:
+Once set up, a user can type (using `@bot`, `@ocr`, `@worker`, or `@ai`):
 - `@bot retry` - Reprocesses the document (deletes the old draft bill if it exists).
 - `@bot force` - Forces reprocessing even if the old bill is posted.
 - `@bot retry vendor is actually Blinkfreight, not Proseso` - Passes the hint to the AI during extraction.
@@ -324,9 +326,9 @@ Once set up, a user can type:
 
 #### 3. Checklist (Odoo 19 fields)
 
-- **URL**: No trailing slash. Path must be exactly `/webhook/document-upload` or `/webhook/document-delete`.
-- **Fields** (or custom body): Request body must contain the document’s database ID as one of: `doc_id`, `document_id`, or `id`. **Sample Payload** shows what will be sent.
-- **Secret**: Either header `x-worker-secret` = your `WORKER_SHARED_SECRET` from `.env`, or in the body: `worker_secret` = that same value.
+- **URL**: Make sure to append `?worker_secret=Papaya3562` (or your chosen secret) to the end of the URL.
+- **Fields**: Instead of writing a custom JSON body, use the "Fields" dropdown to select the needed information (typically just **ID** or **Record ID** + **Contents** for chatter).
+- **Secret**: Included in the query string, so you don't need to add it to headers or the body.
 
 #### 4. Multi-target and delete behaviour
 

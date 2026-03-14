@@ -19,9 +19,10 @@
 
 Each file goes through:
 
-1. **Vision API** – OCR (image: 1–2 calls; PDF: 1 async job, billed per page).
-2. **Gemini – extraction** – 1 call (`extractInvoiceWithGemini`: prompt + OCR text + optional inline image).
-3. **Gemini – account assignment** – 1 call (`assignAccountsWithGemini`: text only, when expense accounts exist).
+1.  **Vision API** – OCR (image: 1–2 calls; PDF: 1 async job, billed per page).
+2.  **Gemini – extraction** – 1 call (`extractInvoiceWithGemini`: prompt + OCR text + optional inline image).
+3.  **Gemini – account assignment** – 1 call (`assignAccountsWithGemini`: text only, when expense accounts exist).
+4.  **Gemini - vendor research** - 1 call (`researchVendorWithGemini`: text only, researches vendor name using Google Search).
 
 Current config uses **`gemini-3-pro-preview`** with fallback **`gemini-2.5-pro`**. Pricing below uses **Gemini 3 Pro** standard (non-batch) and **Vision DOCUMENT_TEXT_DETECTION** tier 1.
 
@@ -59,21 +60,23 @@ Current config uses **`gemini-3-pro-preview`** with fallback **`gemini-2.5-pro`*
 |------|-----------------|-----------------|
 | Extraction (prompt + OCR + optional image) | ~6,000 | ~800 |
 | Account assignment (prompt + accounts + lines) | ~3,000 | ~500 |
+| Vendor Research (prompt + vendor name) | ~500 | ~200 |
 
 **Monthly totals (1,500 files):**
 
 - Extraction: 1,500 × (6,000 in + 800 out) = 9M in, 1.2M out.
 - Account assignment: 1,500 × (3,000 in + 500 out) = 4.5M in, 0.75M out.
+- Vendor Research: 1,500 x (500 in + 200 out) = 0.75M in, 0.3M out.
 
-**Combined:** 13.5M input, 1.95M output.
+**Combined:** 14.25M input, 2.25M output.
 
 **Cost:**
 
-- Input: 13.5 × $2.00 = **$27.00**
-- Output: 1.95 × $12.00 = **$23.40**
-- **Gemini total ≈ $50.40/month.**
+- Input: 14.25 × $2.00 = **$28.50**
+- Output: 2.25 × $12.00 = **$27.00**
+- **Gemini total ≈ $55.50/month.**
 
-*(Retries/fallback to gemini-2.5-pro add a small buffer; 2.5 Pro is slightly cheaper, so round to **~$50–55/month** for Gemini.)*
+*(Retries/fallback to gemini-2.5-pro add a small buffer; 2.5 Pro is slightly cheaper, so round to **~$55–60/month** for Gemini.)*
 
 ---
 
@@ -94,7 +97,7 @@ So **Cloud Run is small** compared to Gemini/Vision unless you run very frequent
 
 ## 6. Other (GCS, Sheets, Odoo)
 
-- **GCS:** PDF staging (upload + OCR output), optional state objects. For 1,500 files and modest object sizes, **&lt; $1/month**.
+- **GCS:** PDF staging (upload + OCR output), optional state objects. For 1,500 files and modest object sizes, **< $1/month**.
 - **Sheets API:** Routing/account reads; well within free tier.
 - **Odoo:** Your infrastructure; no direct GCP cost.
 
@@ -105,21 +108,21 @@ So **Cloud Run is small** compared to Gemini/Vision unless you run very frequent
 | Component | Low | Mid | High |
 |-----------|-----|-----|------|
 | Vision API | $1.88 | $3.79 | $5.50 |
-| Gemini (3 Pro) | $48 | $52 | $58 |
+| Gemini (3 Pro) | $53 | $57 | $63 |
 | Cloud Run | $1 | $2 | $5 |
 | GCS / other | $0.50 | $1 | $2 |
-| **Total** | **~$51** | **~$59** | **~$70** |
+| **Total** | **~$56** | **~$64** | **~$75** |
 
-**Summary:** **About $55–60/month** for 1,500 files across 30 databases running concurrently, with Vision and Gemini (gemini-3-pro-preview) as the main cost.
+**Summary:** **About $60–65/month** for 1,500 files across 30 databases running concurrently, with Vision and Gemini (gemini-3-pro-preview) as the main cost.
 
 ---
 
 ## 8. Cost reduction options
 
-1. **Gemini:** Use **gemini-2.5-pro** as primary (input $1.25/1M, output $10/1M) → saves ~20–25% on Gemini (~**$10–12/month**).
-2. **Gemini Batch API:** 50% discount for non-real-time; if you can queue extraction/account calls and process in batch, Gemini cost could drop by ~50% (workflow change required).
-3. **Vision:** Reduce PDF page cap (`PDF_OCR_MAX_PAGES`) or skip very long PDFs to lower units.
-4. **Concurrency:** Fewer concurrent runs (e.g. sequential or batched targets) don’t change Vision/Gemini volume; they only affect Cloud Run scaling and burst.
+1.  **Gemini:** Use **gemini-2.5-pro** as primary (input $1.25/1M, output $10/1M) → saves ~20–25% on Gemini (~**$12–15/month**).
+2.  **Gemini Batch API:** 50% discount for non-real-time; if you can queue extraction/account calls and process in batch, Gemini cost could drop by ~50% (workflow change required).
+3.  **Vision:** Reduce PDF page cap (`PDF_OCR_MAX_PAGES`) or skip very long PDFs to lower units.
+4.  **Concurrency:** Fewer concurrent runs (e.g. sequential or batched targets) don’t change Vision/Gemini volume; they only affect Cloud Run scaling and burst.
 
 ---
 
@@ -127,9 +130,9 @@ So **Cloud Run is small** compared to Gemini/Vision unless you run very frequent
 
 | Files/month | Vision (mid) | Gemini (mid) | Total (approx) |
 |-------------|--------------|--------------|----------------|
-| 1,500 | ~$4 | ~$52 | **~$59** |
-| 3,000 | ~$8 | ~$104 | **~$115** |
-| 5,000 | ~$14 | ~$173 | **~$190** |
+| 1,500 | ~$4 | ~$57 | **~$64** |
+| 3,000 | ~$8 | ~$114 | **~$125** |
+| 5,000 | ~$14 | ~$190 | **~$210** |
 
 Cost scales roughly linearly with file count; concurrency (30 DBs) mainly affects latency and Cloud Run instance count, not API volume.
 
