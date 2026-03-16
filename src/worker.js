@@ -1138,12 +1138,20 @@ function pickBillLevelTaxIds(taxMap, extracted, vendorCountry) {
   return taxMap.genericId ? [taxMap.genericId] : [];
 }
 
-function pickLineTaxIds(taxMap, lineItem, billGoodsOrServices, vendorCountry, extracted) {
+function pickLineTaxIds(taxMap, lineItem, billGoodsOrServices, vendorCountry, extracted, resolvedAccountName = "") {
   const vatCode = String(lineItem.vat_code || "").toLowerCase();
-  const gs = String(lineItem.goods_or_services || billGoodsOrServices || "").toLowerCase();
   const isCapital = !!(lineItem.is_capital_goods);
   const isImported = !!(lineItem.is_imported);
   const cat = String(lineItem.expense_category || "").toLowerCase();
+  const acctName = String(resolvedAccountName || "").toLowerCase();
+
+  // Resolve goods_or_services: line-level > bill-level > account-based inference
+  let gs = String(lineItem.goods_or_services || billGoodsOrServices || "").toLowerCase();
+  // Account names clearly indicate goods (COGS, Purchases, Inventory, etc.)
+  const GOODS_ACCT_RE = /\bcogs\b|cost.of.good|cost.of.sale|\bpurchase|\binventor|\bmerchandis|\braw.material|\bsuppli/;
+  const SERVICES_ACCT_RE = /\bservice\b|professional.fee|consultanc|legal.fee|\brent\b|repair.*maint|freight|commission/;
+  if (acctName && GOODS_ACCT_RE.test(acctName)) gs = "goods";
+  else if (acctName && SERVICES_ACCT_RE.test(acctName) && gs !== "goods") gs = "services";
 
   let isPH = true;
   if (typeof extracted?.vendor_details?.address === "object" && extracted?.vendor_details?.address !== null) {
@@ -2129,16 +2137,24 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
       const item = lineItems[i];
       const lineVatCode = String(item.vat_code || "").toLowerCase();
 
+      const acctMeta = lineAccountMeta?.[i] || {};
+
       let lineTaxIds;
       if (hasPerLineVat && lineVatCode) {
-        lineTaxIds = pickLineTaxIds(taxMap, item, billGs, vendorCountry, extracted);
+        lineTaxIds = pickLineTaxIds(taxMap, item, billGs, vendorCountry, extracted, acctMeta.name);
       } else {
         lineTaxIds = billLevelTaxIds;
+        // Refine goods/services discrimination using account name when bill-level assigned a standard vatable tax.
+        // Skip refinement for exempt/zero-rated/capital — those are correct as-is.
+        const vatableTaxIds = new Set([taxMap.goodsId, taxMap.servicesId, taxMap.genericId].filter(Boolean));
+        if (lineTaxIds.length === 1 && vatableTaxIds.has(lineTaxIds[0]) && acctMeta.name) {
+          const refined = pickLineTaxIds(taxMap, { ...item, vat_code: "vatable" }, billGs, vendorCountry, extracted, acctMeta.name);
+          if (refined.length) lineTaxIds = refined;
+        }
       }
 
       // Append EWT (withholding tax) if applicable
       const lineGs = String(item.goods_or_services || billGs || "").toLowerCase();
-      const acctMeta = lineAccountMeta?.[i] || {};
       const ewtId = pickEwtTaxId(taxMap, item.expense_category, lineGs, entityFlags, extracted, acctMeta.name, acctMeta.code);
       if (ewtId && !lineTaxIds.includes(ewtId)) {
         lineTaxIds = [...lineTaxIds, ewtId];
@@ -2214,7 +2230,16 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
     const singleGs = String(extracted?.vat?.goods_or_services || "").toLowerCase();
     const singleAcctMeta = lineAccountMeta?.[0] || {};
     const singleEwtId = pickEwtTaxId(taxMap, singleCat, singleGs, entityFlags, extracted, singleAcctMeta.name, singleAcctMeta.code);
+    // Refine goods/services discrimination using account name (same logic as multi-line path)
+    const singleVatableTaxIds = new Set([taxMap.goodsId, taxMap.servicesId, taxMap.genericId].filter(Boolean));
     let singleTaxIds = [...billLevelTaxIds];
+    if (singleTaxIds.length === 1 && singleVatableTaxIds.has(singleTaxIds[0]) && singleAcctMeta.name) {
+      const singleRefined = pickLineTaxIds(
+        taxMap, { vat_code: "vatable", goods_or_services: singleGs }, singleGs,
+        vendorCountry, extracted, singleAcctMeta.name
+      );
+      if (singleRefined.length) singleTaxIds = singleRefined;
+    }
     if (singleEwtId && !singleTaxIds.includes(singleEwtId)) {
       singleTaxIds.push(singleEwtId);
       if (!whtDetectedOnInvoice && isProfFeesContext(singleCat, singleAcctMeta.name)) profFeesEwtApplied = true;
