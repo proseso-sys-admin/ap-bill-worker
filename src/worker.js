@@ -1421,13 +1421,27 @@ async function resolveCurrencyId(odoo, companyId, currencyCode) {
   if (!currencyCode) return null;
   const code = currencyCode.toUpperCase().trim();
   if (!code || code === "PHP") return null;
+  // Try active first
   const rows = await odoo.searchRead(
     "res.currency",
     [["name", "=", code], ["active", "=", true]],
     ["id"],
     kwWithCompany(companyId, { limit: 1 })
   );
-  return rows?.[0]?.id ? Number(rows[0].id) : null;
+  if (rows?.[0]?.id) return Number(rows[0].id);
+  // Currency exists but is inactive — activate it and return its ID
+  try {
+    const inactive = await odoo.searchRead(
+      "res.currency", [["name", "=", code]], ["id"],
+      { limit: 1, context: { active_test: false } }
+    );
+    if (inactive?.[0]?.id) {
+      const currId = Number(inactive[0].id);
+      await odoo.write("res.currency", [currId], { active: true });
+      return currId;
+    }
+  } catch (_) {}
+  return null;
 }
 
 // --- Expense Account Resolution ---
@@ -2956,74 +2970,118 @@ async function processOneDocument(args) {
     const ewtCountry = String(entityFlags?.country || "").trim();
     const isPHEntity = !ewtCountry || /philipp|^ph$/i.test(ewtCountry);
     if (isPHEntity) {
-      const vendorExempt = isVendorEwtExempt(extracted);
-      if (vendorExempt) {
-        const exemptEt = String(extracted?.vendor_details?.entity_type || "").toLowerCase();
-        const exemptLabel = exemptEt === "general_professional_partnership" ? "General Professional Partnership (GPP)"
-          : exemptEt === "non_profit_organization" ? "Non-Profit Organization"
-          : exemptEt === "cooperative" ? "Cooperative"
-          : exemptEt === "government_entity" ? "Government Entity"
-          : exemptEt;
-        const exemptReason = exemptEt === "general_professional_partnership"
-          ? "GPPs are pass-through entities exempt from income tax; payments are not subject to EWT."
-          : exemptEt === "non_profit_organization"
-          ? "Non-profit organizations are exempt from income tax under NIRC Sec. 30; payments are not subject to EWT."
-          : exemptEt === "cooperative"
-          ? "Cooperatives are exempt from income tax under the Cooperative Code; payments are not subject to EWT."
-          : "Government entities are exempt from EWT.";
-        await safeMessagePost(
-          odoo, companyId, "account.move", Number(billId),
-          `<b>🏛️ EWT exempt</b> — Vendor classified as ${exemptLabel}. ${exemptReason}`
-        );
+      // Check whether the vendor is a foreign entity (not subject to PH EWT)
+      let vendorIsForeign = false;
+      let vendorForeignCountry = "";
+      if (typeof extracted?.vendor_details?.address === "object" && extracted?.vendor_details?.address !== null) {
+        const vc = String(extracted.vendor_details.address.country || "").trim();
+        if (vc && !/philipp|^ph$/i.test(vc)) { vendorIsForeign = true; vendorForeignCountry = vc; }
+      } else {
+        const vcStr = String(extracted?.vendor_details?.address || "").trim();
+        if (vcStr && !/philipp|^ph$/i.test(vcStr) && /singapore|sg\b|hong.kong|japan|usa|united.states|australia|malaysia|indonesia|china|taiwan|korea|india|uk\b|united.kingdom/i.test(vcStr)) {
+          vendorIsForeign = true; vendorForeignCountry = vcStr;
+        }
       }
-      const ewtMap = taxMap.ewt || {};
-      const hasAnyEwt = Object.values(ewtMap).some((v) => v > 0);
+
       const isTwa = !!entityFlags?.isTopWithholdingAgent;
-      const wht = extracted?.withholding_tax;
-      const invoiceEwtDetected = !!(wht?.detected);
-      const ewtParts = [];
-      if (isTwa) ewtParts.push("Entity is a Top Withholding Agent (TWA)");
-      const vendorIndiv = isVendorIndividual(extracted);
-      if (vendorIndiv === true) ewtParts.push("Vendor: individual/sole proprietor (WI codes)");
-      else if (vendorIndiv === false && !vendorExempt) ewtParts.push("Vendor: corporation/juridical (WC codes)");
-      if (invoiceEwtDetected) {
-        const detailParts = [];
-        if (wht.ewt_rate) detailParts.push(`rate: ${wht.ewt_rate}%`);
-        if (wht.ewt_amount) detailParts.push(`amount: ${Number(wht.ewt_amount).toFixed(2)}`);
-        if (wht.atc_code) detailParts.push(`ATC: ${wht.atc_code}`);
-        if (wht.bir_form_reference) detailParts.push(`BIR Form: ${wht.bir_form_reference}`);
-        ewtParts.push(`Invoice shows withholding tax (${detailParts.join(", ")})`);
-      }
-      if (!hasAnyEwt && (isTwa || invoiceEwtDetected)) {
-        await safeMessagePost(
-          odoo, companyId, "account.move", Number(billId),
-          `<b>⚠️ Withholding tax notice:</b> No EWT tax records found in the database. ` +
-          `Please create the appropriate withholding tax records (e.g., EWT 1%, 2%, 5%, 10%) ` +
-          `and the system will automatically apply them on future bills.` +
-          (ewtParts.length ? `<br/>${ewtParts.join("<br/>")}` : ``)
-        );
-      } else if (ewtParts.length && hasAnyEwt) {
-        await safeMessagePost(
-          odoo, companyId, "account.move", Number(billId),
-          `<b>🏛️ EWT applied</b> — ${ewtParts.join(". ")}. ` +
-          `Expanded withholding tax applied on bill lines per BIR RR 11-2018.`
-        );
-      }
-      if (profFeesEwtApplied) {
-        const vendorIndivForMsg = isVendorIndividual(extracted);
-        const higherRate = vendorIndivForMsg === false ? 15 : 10;
-        const lowerRate = vendorIndivForMsg === false ? 10 : 5;
-        const profFeesNote = vendorIndivForMsg !== false
-          ? `To avail the lower ${lowerRate}% rate, the vendor must submit a <b>Sworn Declaration</b> ` +
-            `(Annex B-2 of BIR RR 14-2018) certifying that their gross receipts for the current year ` +
-            `will not exceed ₱3,000,000. Please request this document from the vendor before processing payment.`
-          : `${higherRate}% is the standard rate for corporate/juridical persons under ATC WC010 (BIR RR 2-98). ` +
-            `If the vendor qualifies for the ${lowerRate}% rate, request the applicable BIR exemption certificate or ruling.`;
-        await safeMessagePost(
-          odoo, companyId, "account.move", Number(billId),
-          `<b>📋 Professional fees EWT — ${higherRate}% applied (conservative rate).</b><br/>${profFeesNote}`
-        );
-      }
+
+      if (vendorIsForeign) {
+        // Foreign vendor: EWT does not apply; post a note if company is TWA or invoice shows WHT
+        const wht = extracted?.withholding_tax;
+        if (isTwa || wht?.detected) {
+          await safeMessagePost(
+            odoo, companyId, "account.move", Number(billId),
+            `<b>🌐 EWT not applied — foreign vendor.</b><br/>` +
+            `Vendor is based in <b>${vendorForeignCountry}</b>. Philippine Expanded Withholding Tax (EWT/ATC WI/WC) ` +
+            `only applies to payments to domestic/resident payees.<br/>` +
+            (isTwa
+              ? `As a <b>Top Withholding Agent (TWA)</b>, this company has withholding obligations — but for non-resident foreign corporations, ` +
+                `<b>Final Withholding Tax (FWT)</b> may apply under applicable BIR Revenue Regulations or tax treaty (e.g., RP-Singapore Tax Treaty). ` +
+                `Please consult your tax advisor to determine the correct FWT treatment.`
+              : `If the vendor has Philippine-source income, Final Withholding Tax (FWT) may apply. Please consult your tax advisor.`)
+          );
+        }
+      } else {
+        // Domestic vendor: standard EWT chatter
+        const vendorExempt = isVendorEwtExempt(extracted);
+        if (vendorExempt) {
+          const exemptEt = String(extracted?.vendor_details?.entity_type || "").toLowerCase();
+          const exemptLabel = exemptEt === "general_professional_partnership" ? "General Professional Partnership (GPP)"
+            : exemptEt === "non_profit_organization" ? "Non-Profit Organization"
+            : exemptEt === "cooperative" ? "Cooperative"
+            : exemptEt === "government_entity" ? "Government Entity"
+            : exemptEt;
+          const exemptReason = exemptEt === "general_professional_partnership"
+            ? "GPPs are pass-through entities exempt from income tax; payments are not subject to EWT."
+            : exemptEt === "non_profit_organization"
+            ? "Non-profit organizations are exempt from income tax under NIRC Sec. 30; payments are not subject to EWT."
+            : exemptEt === "cooperative"
+            ? "Cooperatives are exempt from income tax under the Cooperative Code; payments are not subject to EWT."
+            : "Government entities are exempt from EWT.";
+          await safeMessagePost(
+            odoo, companyId, "account.move", Number(billId),
+            `<b>🏛️ EWT exempt</b> — Vendor classified as ${exemptLabel}. ${exemptReason}`
+          );
+        }
+        const ewtMap = taxMap.ewt || {};
+        const hasAnyEwt = Object.values(ewtMap).some((v) => v > 0);
+        const wht = extracted?.withholding_tax;
+        const invoiceEwtDetected = !!(wht?.detected);
+        const ewtParts = [];
+        if (isTwa) ewtParts.push("Entity is a Top Withholding Agent (TWA)");
+        const vendorIndiv = isVendorIndividual(extracted);
+        if (vendorIndiv === true) ewtParts.push("Vendor: individual/sole proprietor (WI codes)");
+        else if (vendorIndiv === false && !vendorExempt) ewtParts.push("Vendor: corporation/juridical (WC codes)");
+        if (invoiceEwtDetected) {
+          const detailParts = [];
+          if (wht.ewt_rate) detailParts.push(`rate: ${wht.ewt_rate}%`);
+          if (wht.ewt_amount) detailParts.push(`amount: ${Number(wht.ewt_amount).toFixed(2)}`);
+          if (wht.atc_code) detailParts.push(`ATC: ${wht.atc_code}`);
+          if (wht.bir_form_reference) detailParts.push(`BIR Form: ${wht.bir_form_reference}`);
+          ewtParts.push(`Invoice shows withholding tax (${detailParts.join(", ")})`);
+        }
+        // TWA companies need WC158/WI158 (1%) for goods purchases; warn if that rate is missing
+        const has1PctEwt = (ewtMap.wc1 > 0) || (ewtMap.wi1 > 0);
+        if (isTwa && !has1PctEwt) {
+          await safeMessagePost(
+            odoo, companyId, "account.move", Number(billId),
+            `<b>⚠️ TWA setup incomplete — EWT 1% (WC158/WI158) not found.</b><br/>` +
+            `As a Top Withholding Agent, goods and inventory purchases require 1% EWT (ATC WC158 for corporations, WI158 for individuals). ` +
+            `No 1% withholding tax record was found in the database, so it could not be applied. ` +
+            `Please create a withholding tax record at <b>Accounting → Configuration → Taxes</b> with rate <b>-1%</b> and ATC code <b>WC158</b>/<b>WI158</b>.`
+          );
+        }
+        if (!hasAnyEwt && (isTwa || invoiceEwtDetected)) {
+          await safeMessagePost(
+            odoo, companyId, "account.move", Number(billId),
+            `<b>⚠️ Withholding tax notice:</b> No EWT tax records found in the database. ` +
+            `Please create the appropriate withholding tax records (e.g., EWT 1%, 2%, 5%, 10%) ` +
+            `and the system will automatically apply them on future bills.` +
+            (ewtParts.length ? `<br/>${ewtParts.join("<br/>")}` : ``)
+          );
+        } else if (ewtParts.length && hasAnyEwt) {
+          await safeMessagePost(
+            odoo, companyId, "account.move", Number(billId),
+            `<b>🏛️ EWT applied</b> — ${ewtParts.join(". ")}. ` +
+            `Expanded withholding tax applied on bill lines per BIR RR 11-2018.`
+          );
+        }
+        if (profFeesEwtApplied) {
+          const vendorIndivForMsg = isVendorIndividual(extracted);
+          const higherRate = vendorIndivForMsg === false ? 15 : 10;
+          const lowerRate = vendorIndivForMsg === false ? 10 : 5;
+          const profFeesNote = vendorIndivForMsg !== false
+            ? `To avail the lower ${lowerRate}% rate, the vendor must submit a <b>Sworn Declaration</b> ` +
+              `(Annex B-2 of BIR RR 14-2018) certifying that their gross receipts for the current year ` +
+              `will not exceed ₱3,000,000. Please request this document from the vendor before processing payment.`
+            : `${higherRate}% is the standard rate for corporate/juridical persons under ATC WC010 (BIR RR 2-98). ` +
+              `If the vendor qualifies for the ${lowerRate}% rate, request the applicable BIR exemption certificate or ruling.`;
+          await safeMessagePost(
+            odoo, companyId, "account.move", Number(billId),
+            `<b>📋 Professional fees EWT — ${higherRate}% applied (conservative rate).</b><br/>${profFeesNote}`
+          );
+        }
+      } // end domestic vendor EWT block
     }
   }
 
