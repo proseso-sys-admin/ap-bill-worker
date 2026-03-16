@@ -1196,6 +1196,48 @@ function pickLineTaxIds(taxMap, lineItem, billGoodsOrServices, vendorCountry, ex
  * Picks the EWT tax ID from taxMap.ewt by rate and vendor type (individual vs corporate).
  * vendorIsIndividual: true = WI codes, false = WC codes.
  */
+/**
+ * Returns the EWT rate (1, 2, 5, 10, 15) for a given tax ID by reverse-looking up the ewtMap.
+ * Returns 0 if the ID is not found.
+ */
+function ewtRateFromId(taxMap, ewtId) {
+  if (!ewtId) return 0;
+  const ewt = taxMap.ewt || {};
+  if (ewtId === ewt.wi1 || ewtId === ewt.wc1) return 1;
+  if (ewtId === ewt.wi2 || ewtId === ewt.wc2) return 2;
+  if (ewtId === ewt.wi5 || ewtId === ewt.wc5) return 5;
+  if (ewtId === ewt.wi10 || ewtId === ewt.wc10) return 10;
+  if (ewtId === ewt.wi15 || ewtId === ewt.wc15) return 15;
+  return 0;
+}
+
+/**
+ * Checks whether the applied EWT rate is inconsistent with the resolved account name.
+ * Returns { rate, expectedCategory, message } if there is a mismatch, or null if consistent.
+ */
+function ewtAccountMismatch(taxMap, ewtId, accountName) {
+  const rate = ewtRateFromId(taxMap, ewtId);
+  if (!rate || !accountName) return null;
+  const a = String(accountName).toLowerCase();
+  if (rate === 5) {
+    // 5% = rent/lease — account should suggest rentals
+    const isRentAcct = /\brent\b|\blease\b|\blessor\b|space.rental|office.space/.test(a);
+    const isConflictAcct = /advertis|promot|market|supplies|purchase|cogs|insurance|salari|depreciat|equipment|machin/.test(a);
+    if (!isRentAcct && isConflictAcct) {
+      return { rate, expectedCategory: "rent/lease", message: `5% WI/WC100 (rent EWT) was applied but account is "${accountName}" — verify category is rent/lease, not ${a.split(" ").slice(-3).join(" ")}` };
+    }
+  }
+  if (rate === 10 || rate === 15) {
+    // 10/15% = professional fees
+    const isProfAcct = /professional|consultanc|legal\b|audit\b|advisory|accountant|engineer|architect|doctor|notari/.test(a);
+    const isConflictAcct = /supplies|purchase|cogs|inventor|advertis|promot|market|\brent\b/.test(a);
+    if (!isProfAcct && isConflictAcct) {
+      return { rate, expectedCategory: "professional fees", message: `${rate}% WI/WC010 (professional fees EWT) was applied but account is "${accountName}" — verify category` };
+    }
+  }
+  return null;
+}
+
 function ewtIdByRate(taxMap, rate, vendorIsIndividual) {
   const ewt = taxMap.ewt || {};
   const r = Math.round(Number(rate) || 0);
@@ -2119,6 +2161,8 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
   // Track whether the system applied the conservative higher rate for professional fees.
   // Not set when the invoice itself already shows an explicit EWT rate (we honour that instead).
   let profFeesEwtApplied = false;
+  let anyEwtApplied = false;
+  const ewtMismatches = []; // { lineDesc, rate, accountName } for EWT/account inconsistencies
   const whtDetectedOnInvoice = !!(extracted?.withholding_tax?.detected);
   const PROF_FEES_ACCOUNT_RE = /professional.fee|professional.service|consultanc|consulting.fee|\blegal\b|audit\b|advisory|accountant|engineer|architect|doctor|notari/;
   const isProfFeesContext = (category, accountName) => {
@@ -2158,7 +2202,10 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
       const ewtId = pickEwtTaxId(taxMap, item.expense_category, lineGs, entityFlags, extracted, acctMeta.name, acctMeta.code);
       if (ewtId && !lineTaxIds.includes(ewtId)) {
         lineTaxIds = [...lineTaxIds, ewtId];
+        anyEwtApplied = true;
         if (!whtDetectedOnInvoice && isProfFeesContext(item.expense_category, acctMeta.name)) profFeesEwtApplied = true;
+        const mismatch = ewtAccountMismatch(taxMap, ewtId, acctMeta.name);
+        if (mismatch) ewtMismatches.push({ lineDesc: String(item.description || item.name || "").slice(0, 50), ...mismatch, accountName: acctMeta.name });
       }
 
       const lineHasTax = lineTaxIds.length > 0 && lineVatCode !== "no_vat";
@@ -2242,7 +2289,10 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
     }
     if (singleEwtId && !singleTaxIds.includes(singleEwtId)) {
       singleTaxIds.push(singleEwtId);
+      anyEwtApplied = true;
       if (!whtDetectedOnInvoice && isProfFeesContext(singleCat, singleAcctMeta.name)) profFeesEwtApplied = true;
+      const singleMismatch = ewtAccountMismatch(taxMap, singleEwtId, singleAcctMeta.name);
+      if (singleMismatch) ewtMismatches.push({ lineDesc: String(lineItems[0]?.description || "").slice(0, 50), ...singleMismatch, accountName: singleAcctMeta.name });
     }
     if (singleTaxIds.length) line.tax_ids = [[6, 0, singleTaxIds]];
     else line.tax_ids = [[5, 0, 0]]; // Explicitly clear taxes to prevent Odoo from applying account defaults
@@ -2260,7 +2310,7 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
   if (currencyId) vals.currency_id = Number(currencyId);
   if (ref) vals.ref = ref;
   if (invoiceDate) vals.invoice_date = invoiceDate;
-  return { vals, profFeesEwtApplied };
+  return { vals, profFeesEwtApplied, anyEwtApplied, ewtMismatches };
 }
 
 const documentFieldSupportCache = new Map();
@@ -2836,7 +2886,7 @@ async function processOneDocument(args) {
     });
   }
 
-  const { vals: billVals, profFeesEwtApplied } = buildBillVals(
+  const { vals: billVals, profFeesEwtApplied, anyEwtApplied, ewtMismatches } = buildBillVals(
     extracted,
     vendor.id,
     companyId,
@@ -3084,11 +3134,21 @@ async function processOneDocument(args) {
             `and the system will automatically apply them on future bills.` +
             (ewtParts.length ? `<br/>${ewtParts.join("<br/>")}` : ``)
           );
-        } else if (ewtParts.length && hasAnyEwt) {
+        } else if (anyEwtApplied && hasAnyEwt) {
           await safeMessagePost(
             odoo, companyId, "account.move", Number(billId),
             `<b>🏛️ EWT applied</b> — ${ewtParts.join(". ")}. ` +
             `Expanded withholding tax applied on bill lines per BIR RR 11-2018.`
+          );
+        }
+        // Warn about EWT/account category mismatches (e.g. rent EWT on advertising account)
+        for (const m of ewtMismatches) {
+          await safeMessagePost(
+            odoo, companyId, "account.move", Number(billId),
+            `<b>⚠️ EWT/account mismatch</b>${m.lineDesc ? ` — <i>${m.lineDesc}</i>` : ""}:<br/>` +
+            `${m.message}.<br/>` +
+            `If the account is correct, update the expense category on the invoice. ` +
+            `If the category is correct (${m.expectedCategory}), move the line to the appropriate account (e.g. Rent Expense / Lease).`
           );
         }
         if (profFeesEwtApplied) {
