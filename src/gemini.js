@@ -223,6 +223,15 @@ const extractionSchema = {
         required: ["description", "quantity", "unit_price", "amount", "discount_percent", "unit_price_includes_vat", "expense_category", "goods_or_services", "is_capital_goods", "is_imported", "vat_code"]
       }
     },
+    billed_to: {
+      type: "object",
+      description: "The entity that the invoice is addressed/billed to (the buyer — who is receiving the goods/services and is being asked to pay).",
+      properties: {
+        name: { type: "string", description: "Full name of the entity being billed as it appears on the invoice (e.g. in 'Bill To:', 'Sold To:', 'Client:', 'Attention:' fields)" },
+        confidence: { type: "number", description: "Confidence 0-1 that this is the correct billed-to entity name" }
+      },
+      required: ["name", "confidence"]
+    },
     warnings: { type: "array", items: { type: "string" } }
   },
   required: [
@@ -234,7 +243,8 @@ const extractionSchema = {
     "amount_candidates",
     "line_items",
     "vendor_details",
-    "expense_account_hint"
+    "expense_account_hint",
+    "billed_to"
   ]
 };
 
@@ -478,6 +488,19 @@ DATE FORMAT RULES (CRITICAL):
   - If the document uses numeric separators only (e.g. "03/11/2026"), treat it as MM/DD/YYYY UNLESS the first number is > 12 (in which case it must be DD/MM/YYYY).
   - When ambiguous (both values ≤ 12), default to MM/DD/YYYY — do NOT flip to DD/MM/YYYY just because the vendor is from a country that commonly uses that format.
 - Add a warning if the date format is genuinely ambiguous.
+
+BILLED-TO ENTITY (who is being asked to pay this invoice):
+- Look for labels: "Bill To:", "Billed To:", "Sold To:", "Client:", "Customer:", "Consignee:", "Attention:", or a name/address block that clearly belongs to the BUYER, not the seller.
+- This is the BUYER/CLIENT, not the vendor/issuer. It is often a different company from the vendor.
+- On PH official receipts, the buyer name may appear in a printed "Name:" field near the top or in a customer details section.
+- If the invoice has no explicit "Bill To" section but has an address block that is clearly the recipient (e.g. a PH company address different from the vendor), use that.
+- If no billed-to entity can be identified, set name to "" and confidence to 0.
+
+LINE ITEM STRUCTURE (CRITICAL — avoid phantom lines):
+- Some invoices use a TWO-ROW layout per billable item: a bold/header row with the service name and total amount, followed by an indented detail row with the quantity, unit price, and specifics. These two rows are ONE line item, not two.
+- If you see a row with a description and an amount BUT no quantity/unit price, followed by a row with quantity, unit price, and the same or matching amount — combine them into one line item. Use the indented/detail row's quantity and unit price, and append the header description to the line description.
+- NEVER extract a sub-description row (indented detail, period/date range, or explanatory note with 0.00 amount) as a separate line item. It belongs to the preceding line item's description.
+- A line item with unit_price = 0 and amount = 0 that is clearly a sub-row or note should NOT appear as a separate entry in line_items. Merge its text into the description of the adjacent line item instead.
 
 Rules:
 - line_items may be [] if not confident.

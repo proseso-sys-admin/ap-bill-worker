@@ -2453,36 +2453,45 @@ async function linkDocumentToBill(odoo, companyId, docId, billId, logger, active
   // Ensure accounting folders are active AFTER moving the document to the active AP folder (if it was archived).
   await ensureAccountingFolderActive(odoo, companyId, journalId, logger, originalFolderId);
 
+  // Step 1: Write res_model/res_id fields WITHOUT folder_id.
+  // Odoo's documents_account module has a _compute_folder_id stored computed field that fires
+  // when res_model/res_id change — it moves the document to the journal's folder (Purchase).
+  // Including folder_id here is futile because the compute overrides it within the same transaction.
   const linkVals = {};
   if (await documentsDocumentHasField(odoo, "res_model")) linkVals.res_model = "account.move";
   if (await documentsDocumentHasField(odoo, "res_id")) linkVals.res_id = Number(billId);
   if (await documentsDocumentHasField(odoo, "account_move_id")) linkVals.account_move_id = Number(billId);
   if (await documentsDocumentHasField(odoo, "invoice_id")) linkVals.invoice_id = Number(billId);
-  if (originalFolderId) linkVals.folder_id = originalFolderId;
 
   if (Object.keys(linkVals).length) {
     await odoo.write("documents.document", [Number(docId)], linkVals);
   }
 
+  // Step 2: Restore folder_id in a SEPARATE write call.
+  // Since res_model/res_id are not changing in this write, _compute_folder_id will NOT re-fire,
+  // so this assignment sticks.
   if (originalFolderId) {
-    const delays = [800, 1500, 3000, 5000];
-    for (let attempt = 0; attempt < delays.length; attempt++) {
-      await sleep(delays[attempt]);
-      try {
-        const rows = await odoo.searchRead(
-          "documents.document",
-          [["id", "=", Number(docId)]],
-          ["id", "folder_id"],
-          kwWithCompany(companyId, { limit: 1 })
-        );
-        const currentFolderId = readFolderId(rows?.[0]);
-        if (currentFolderId === originalFolderId) break;
+    await sleep(300); // small buffer for any async Odoo processing
+    await odoo.write("documents.document", [Number(docId)], { folder_id: originalFolderId });
+    if (logger) logger.info("Set document folder after link.", { docId, originalFolderId });
+
+    // Safety check: verify it stuck, and retry once if it didn't.
+    await sleep(2000);
+    try {
+      const rows = await odoo.searchRead(
+        "documents.document",
+        [["id", "=", Number(docId)]],
+        ["id", "folder_id"],
+        kwWithCompany(companyId, { limit: 1 })
+      );
+      const currentFolderId = readFolderId(rows?.[0]);
+      if (currentFolderId !== originalFolderId) {
         await odoo.write("documents.document", [Number(docId)], { folder_id: originalFolderId });
-        if (logger) logger.info("Restored document folder after link.", {
-          docId, originalFolderId, movedTo: currentFolderId, attempt: attempt + 1
+        if (logger) logger.info("Re-restored document folder after safety check.", {
+          docId, originalFolderId, foundFolderId: currentFolderId
         });
-      } catch (_) {}
-    }
+      }
+    } catch (_) {}
   }
 
   const baseUrl = odoo.baseUrl || "";
@@ -3015,6 +3024,38 @@ async function processOneDocument(args) {
           `<b>📋 Professional fees EWT — ${higherRate}% applied (conservative rate).</b><br/>${profFeesNote}`
         );
       }
+    }
+  }
+
+  // Entity mismatch: warn if the invoice is addressed to a different entity than the Odoo company
+  {
+    const billedToName = String(extracted?.billed_to?.name || "").trim();
+    const billedToConf = Number(extracted?.billed_to?.confidence || 0);
+    if (billedToName && billedToConf >= 0.5) {
+      try {
+        const companyRows = await odoo.searchRead(
+          "res.company", [["id", "=", companyId]], ["id", "name"], { limit: 1 }
+        );
+        const companyName = String(companyRows?.[0]?.name || "").trim();
+        if (companyName) {
+          const normalize = (s) => s.toLowerCase()
+            .replace(/\b(inc|corp|ltd|pte|llc|co\b|sa|sdn|bhd|pty|plc|ph|sg)\b\.?/gi, "")
+            .replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+          const normBilled = normalize(billedToName);
+          const normCompany = normalize(companyName);
+          const isMatch = normBilled.includes(normCompany) || normCompany.includes(normBilled)
+            || normBilled.split(" ").filter(Boolean).some((w) => w.length > 3 && normCompany.includes(w));
+          if (!isMatch) {
+            await safeMessagePost(
+              odoo, companyId, "account.move", Number(billId),
+              `<b>⚠️ Entity mismatch — please verify.</b><br/>` +
+              `Invoice is addressed to: <b>${billedToName}</b><br/>` +
+              `Bill recorded under: <b>${companyName}</b><br/>` +
+              `If this invoice belongs to a different entity, please move it to the correct company before posting.`
+            );
+          }
+        }
+      } catch (_) {}
     }
   }
 
