@@ -3244,6 +3244,29 @@ async function runOne({ logger, payload = {} }) {
     useIsFolder = r.useIsFolder;
   }
 
+  // Guard: only process documents that live inside the configured AP folder (or its subfolders).
+  // The batch-scan path enforces this via listCandidateDocuments; we must mirror that here.
+  if (apFolderId && !isBotCommand) {
+    const docFolderIdVal = readFolderId(doc);
+    if (docFolderIdVal) {
+      const allowedFolderIds = await resolveSubfolderIds(odoo, companyId, apFolderId, useIsFolder);
+      if (!allowedFolderIds.includes(docFolderIdVal)) {
+        logger.info("run-one: document is not in AP folder — skipping.", {
+          docId: doc.id, docFolder: docFolderIdVal, apFolderId
+        });
+        return {
+          ok: true,
+          mode: "run-one",
+          time_start: timeStart,
+          time_completed: new Date().toISOString(),
+          targetKey: target.targetKey,
+          doc: { id: Number(doc.id), name: String(doc.name || ""), attachment_id: m2oId(doc.attachment_id) },
+          result: { status: "skip", reason: "not_in_ap_folder" }
+        };
+      }
+    }
+  }
+
   const result = await processOneDocument({
     logger,
     odoo,
