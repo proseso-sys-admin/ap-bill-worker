@@ -409,7 +409,7 @@ LINE ITEM CATEGORIZATION:
 PROFESSIONAL FEES vs OUTSOURCED SERVICES (CRITICAL for withholding tax):
 - "professional_fees" = services rendered by LICENSED PROFESSIONALS practicing their profession:
   lawyers, CPAs/accountants, engineers, architects, doctors, dentists, auditors, appraisers, management consultants.
-  These are subject to higher EWT rates (WI100/WC100: 5-15%).
+  These are subject to higher EWT rates (WI010/WC010: 5-15%).
 - "outsourced_services" = general business services NOT requiring a professional license:
   BPO, staffing/manpower, janitorial, security, IT support, bookkeeping services, payroll processing,
   consulting firms providing outsourced operations (e.g. "Outsourcing Services Inc.", "Staffing Solutions"),
@@ -681,6 +681,8 @@ RULES (MANDATORY - follow ALL):
    - Printing/stationery → "Office Supplies", "Printing & Stationery"
    - Electricity/water/internet → "Utilities"
    - A consulting/services firm charging for permit/license PROCESSING (e.g. "Business Permit processing", "permit renewal service") → "Professional Fees" or "Outside Services". This is a service fee, NOT "Taxes and Licenses". Only use "Taxes and Licenses" when the invoice is FROM the government agency charging the actual permit/license fee itself.
+   - A property management company / building admin charging rent → "Rent Expense" or "Rental" account (NOT "Outside Services" or "Professional Fees")
+   - A staffing / manpower agency → "Outside Services" or "Contracted Services" (NOT "Professional Fees" — staffing agencies are not licensed professionals)
 
 3. VENDOR NAME IS YOUR STRONGEST CLUE when the item description is unclear (bad OCR, handwritten, brand name gibberish). A "LAUNDRY SHOP" sells laundry services. A "FABRIC TRADING" sells fabric. A "MARKETING CORPORATION" selling beer is a beer distributor.
 
@@ -708,7 +710,16 @@ RULES (MANDATORY - follow ALL):
 
 8. ALTERNATIVES: Always provide 2nd and 3rd best choices. These are critical fallbacks.
 
-9. BILL-LEVEL: Pick the single best account for the whole bill (bill_level_account_id/code/name).`;
+9. BILL-LEVEL: Pick the single best account for the whole bill (bill_level_account_id/code/name).
+
+10. EWT IMPLICATIONS — choose accounts that reflect the correct Philippine withholding tax obligation:
+   - Rent / rental / leasehold payments → use a "Rent Expense" or "Rental" account (EWT: 5%, WI100/WC100)
+   - Licensed professional services (lawyers, CPAs, engineers, doctors, auditors) → "Professional Fees" account (EWT: 5-15%, WI010/WC010)
+   - Outsourced / contracted services (security, janitorial, manpower, IT outsourcing) → "Outside Services" or "Contracted Services" account (EWT: 2%, WI120/WC120)
+   - Utilities (electricity, water, telecom, internet) → "Utilities" account (EWT: 2% if company is TWA, WI160)
+   - Goods / inventory / supplies purchased for resale or use → Inventory/Supplies/COGS account (EWT: 1% if company is TWA, WI158)
+   Do NOT conflate professional fees with outsourced services — they have different EWT rates and ATC codes.
+   Do NOT put a rent payment under "Office Supplies" or "Miscellaneous".`;
 
 
   const body = {

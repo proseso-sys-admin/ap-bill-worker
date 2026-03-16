@@ -1239,15 +1239,15 @@ function isVendorEwtExempt(extracted) {
  * Priority:
  *  1. If the invoice itself shows an EWT rate (extracted.withholding_tax), use that
  *  2. Otherwise, determine from TWA status + expense category per BIR RR 11-2018:
- *     - TWA: 1% goods (WI157/WC157), 2% services (WI158/WC158)
- *     - professional_fees: 5-15% (WI100/WC100)
+ *     - TWA: 1% goods (WI158/WC158), 2% services (WI160/WC160)
+ *     - professional_fees: 5-15% (WI010/WC010)
  *     - outsourced_services: 2% (WI120/WC120)
- *     - rent: 5% (WI120/WC120)
+ *     - rent: 5% (WI100/WC100)
  *     - contractor/repairs: 2% (WI140/WC140)
  *     - commission: 10% (WI150/WC150)
  *     - freight: 2%
  */
-function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, extracted) {
+function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, extracted, resolvedAccountName = "", resolvedAccountCode = "") {
   const { country, isTopWithholdingAgent } = entityFlags || {};
 
   // Only PH entities get EWT
@@ -1271,6 +1271,10 @@ function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, ext
     if (invoiceEwtId) return invoiceEwtId;
   }
 
+  // Account-based EWT: higher priority than category-based, driven by the resolved account
+  const accountEwt = pickEwtByAccount(resolvedAccountName, resolvedAccountCode, taxMap, vendorIndiv, isTopWithholdingAgent);
+  if (accountEwt) return accountEwt;
+
   const cat = String(expenseCategory || "").toLowerCase();
   const gs = String(goodsOrServices || "").toLowerCase();
 
@@ -1282,14 +1286,14 @@ function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, ext
   }
 
   // Non-TWA: specific categories per BIR RR 11-2018
-  // Professional fees: WI100 5%/10% individual, WC100 10%/15% corporate
+  // Professional fees: WI010 5%/10% individual, WC010 10%/15% corporate
   if (cat === "professional_fees") {
     if (vendorIndiv === false) return ewtIdByRate(taxMap, 15, false) || ewtIdByRate(taxMap, 10, false);
     return ewtIdByRate(taxMap, 10, true) || ewtIdByRate(taxMap, 5, true);
   }
   // Outsourced services: 2% (WI120/WC120) — NOT professional fees
   if (cat === "outsourced_services") return ewtIdByRate(taxMap, 2, vendorIndiv);
-  // Rental: 5% (WI120/WC120)
+  // Rental: 5% (WI100/WC100)
   if (cat === "rent") return ewtIdByRate(taxMap, 5, vendorIndiv);
   // Contractors/repairs: 2% (WI140/WC140)
   if (cat === "repairs" || cat === "contractor") return ewtIdByRate(taxMap, 2, vendorIndiv);
@@ -1301,6 +1305,56 @@ function pickEwtTaxId(taxMap, expenseCategory, goodsOrServices, entityFlags, ext
   // Non-TWA with no matching category but invoice shows EWT → still try to apply
   if (wht?.detected && wht.ewt_rate > 0) {
     return ewtIdByRate(taxMap, wht.ewt_rate, vendorIndiv);
+  }
+
+  return 0;
+}
+
+/**
+ * Picks EWT tax ID based on the resolved expense account name.
+ * Returns 0 if no keyword in the account name matches a known EWT pattern.
+ *
+ * BIR ATC reference:
+ *   WI010/WC010 — Professional fees (indiv/corp)
+ *   WI100/WC100 — Rent
+ *   WI120/WC120 — Outsourced / contracted services
+ *   WI140/WC140 — Repairs & maintenance / contractor
+ *   WI150/WC150 — Commission / brokerage
+ *   WI158/WC158 — Goods / inventory (TWA only, 1%)
+ *   WI160/WC160 — Utilities (TWA only, 2%)
+ */
+function pickEwtByAccount(accountName, accountCode, taxMap, vendorIsIndividual, isTWA) {
+  const name = String(accountName || "").toLowerCase();
+  if (!name) return 0;
+
+  // Rent / rental / lease → 5% (WI100/WC100)
+  if (/rent|rental|lease/.test(name)) return ewtIdByRate(taxMap, 5, vendorIsIndividual);
+
+  // Licensed professional fees → 5% individual, 10-15% corporate (WI010/WC010)
+  // Note: \blegal\b prevents false match on "paralegal"; "consulting" covered separately
+  if (/professional.fee|professional.service|consultanc|consulting.fee|\blegal\b|audit\b|advisory|accountant|engineer|architect|doctor|notari/.test(name)) {
+    if (vendorIsIndividual === false) return ewtIdByRate(taxMap, 15, false) || ewtIdByRate(taxMap, 10, false);
+    return ewtIdByRate(taxMap, 10, true) || ewtIdByRate(taxMap, 5, true);
+  }
+
+  // Outsourced / contracted services → 2% (WI120/WC120)
+  // Note: security[\s-]?serv avoids matching unrelated "security" account names (e.g. "Security Deposit")
+  if (/outsourc|janitorial|security[\s-]?serv|manpower|staffing|subcontract/.test(name)) return ewtIdByRate(taxMap, 2, vendorIsIndividual);
+
+  // Commission / brokerage → 10% (WI150/WC150)
+  if (/\b(commission|brokerage)\b/.test(name)) return ewtIdByRate(taxMap, 10, vendorIsIndividual);
+
+  // Repairs / maintenance / contractor → 2% (WI140/WC140)
+  if (/repair|maintenance|contractor\b/.test(name)) return ewtIdByRate(taxMap, 2, vendorIsIndividual);
+
+  // TWA only: utilities → 2% (WI160/WC160)
+  if (isTWA && /utilit|electric|meralco|water\b|pldt|smart\b|globe\b|internet|telecom|telephone/.test(name)) {
+    return ewtIdByRate(taxMap, 2, vendorIsIndividual);
+  }
+
+  // TWA only: goods / inventory / supplies → 1% (WI158/WC158)
+  if (isTWA && /inventor|supplies|merchandise|cost.of.sale|cost.of.good|cogs\b|raw.material/.test(name)) {
+    return ewtIdByRate(taxMap, 1, vendorIsIndividual);
   }
 
   return 0;
@@ -1608,12 +1662,18 @@ async function resolveExpenseAccountId({
   geminiPick, expenseAccounts, accountMapping, targetDb,
   lineDescription, vendorName, targetKey
 }) {
+  // Helper: enrich a result with accountCode + accountName from expenseAccounts
+  const withMeta = (result) => {
+    const acct = expenseAccounts?.find((a) => a.id === result.accountId);
+    return { ...result, accountCode: acct?.code || "", accountName: acct?.name || "" };
+  };
+
   // Tier 1: vendor default (skip if it's a generic account like Admin Expense)
   const vendorAcct = await getVendorDefaultAccountId(odoo, companyId, vendorId);
   if (vendorAcct && expenseAccounts?.length) {
     const vendorAcctObj = expenseAccounts.find((a) => a.id === vendorAcct);
     if (vendorAcctObj && !isGenericAccount(vendorAcctObj)) {
-      return { accountId: vendorAcct, source: "vendor_default" };
+      return withMeta({ accountId: vendorAcct, source: "vendor_default" });
     }
   }
 
@@ -1626,7 +1686,7 @@ async function resolveExpenseAccountId({
       if (!pNorm) continue;
       if (vNorm.includes(pNorm) || pNorm.includes(vNorm)) {
         const acct = expenseAccounts.find((a) => String(a.code || "").trim() === String(entry.account_code || "").trim());
-        if (acct) return { accountId: acct.id, source: "vendor_memory" };
+        if (acct) return withMeta({ accountId: acct.id, source: "vendor_memory" });
       }
     }
   }
@@ -1634,31 +1694,31 @@ async function resolveExpenseAccountId({
   // Tier 3: Gemini pick (validated + repaired via code/name, anti-generic guard)
   if (geminiPick && expenseAccounts?.length) {
     const result = pickBestGeminiAccount(geminiPick, expenseAccounts);
-    if (result.accountId) return result;
+    if (result.accountId) return withMeta(result);
   }
 
   // Tier 4: vendor name keywords (e.g. "FABRIC TRADING" → Supplies)
   if (vendorName && expenseAccounts?.length) {
     const vnHint = vendorNameAccountHint(vendorName, expenseAccounts);
-    if (vnHint) return { accountId: vnHint, source: "vendor_name_hint" };
+    if (vnHint) return withMeta({ accountId: vnHint, source: "vendor_name_hint" });
   }
 
   // Tier 5: sheet mapping (AccountMapping tab)
   if (accountMapping?.length) {
     const mapped = lookupAccountMapping(accountMapping, companyId, category, targetDb);
-    if (mapped) return { accountId: mapped, source: "sheet_mapping" };
+    if (mapped) return withMeta({ accountId: mapped, source: "sheet_mapping" });
   }
 
   // Tier 6: fuzzy name match using line description + category keywords
   if (expenseAccounts?.length) {
     const fuzzy = fuzzyMatchAccount(expenseAccounts, suggestedName, category, lineDescription);
-    if (fuzzy) return { accountId: fuzzy, source: "fuzzy_match" };
+    if (fuzzy) return withMeta({ accountId: fuzzy, source: "fuzzy_match" });
   }
 
   // Tier 7: Gemini pick even if generic (still better than Odoo's blind default)
   if (geminiPick && expenseAccounts?.length) {
     const primaryId = resolveGeminiCandidate(geminiPick, expenseAccounts);
-    if (primaryId) return { accountId: primaryId, source: "gemini_last_resort" };
+    if (primaryId) return withMeta({ accountId: primaryId, source: "gemini_last_resort" });
   }
 
   // Tier 8: best non-generic expense account matching any keyword from description/category/vendor
@@ -1673,18 +1733,18 @@ async function resolveExpenseAccountId({
         const hits = words.filter((w) => hay.includes(w)).length;
         if (hits > bestHits) { bestHits = hits; bestId = acct.id; }
       }
-      if (bestId) return { accountId: bestId, source: "keyword_last_resort" };
-      return { accountId: nonGeneric[0].id, source: "first_non_generic" };
+      if (bestId) return withMeta({ accountId: bestId, source: "keyword_last_resort" });
+      return withMeta({ accountId: nonGeneric[0].id, source: "first_non_generic" });
     }
-    return { accountId: expenseAccounts[0].id, source: "first_available" };
+    return withMeta({ accountId: expenseAccounts[0].id, source: "first_available" });
   }
 
-  // Tier 9: env fallback
+  // Tier 9: env fallback (env ID may not be in expenseAccounts, withMeta handles gracefully)
   if (config.odooDefaults.defaultExpenseAccountId > 0) {
-    return { accountId: config.odooDefaults.defaultExpenseAccountId, source: "env_fallback" };
+    return withMeta({ accountId: config.odooDefaults.defaultExpenseAccountId, source: "env_fallback" });
   }
 
-  return { accountId: 0, source: "none" };
+  return { accountId: 0, accountCode: "", accountName: "", source: "none" };
 }
 
 function adjustPriceForTax(price, invoiceVatInclusive, taxPriceInclude, taxRate) {
@@ -2012,7 +2072,7 @@ function vendorNameAccountHint(vendorName, expenseAccounts) {
   return 0;
 }
 
-function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, purchaseJournalId, currencyId, taxMeta, lineAccountIds, vendorCountry, entityFlags) {
+function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, purchaseJournalId, currencyId, taxMeta, lineAccountIds, vendorCountry, entityFlags, lineAccountMeta) {
   const inv = extracted?.invoice || {};
   const totals = extracted?.totals || {};
   const grandTotal = Number(totals.grand_total || 0);
@@ -2053,7 +2113,8 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
 
       // Append EWT (withholding tax) if applicable
       const lineGs = String(item.goods_or_services || billGs || "").toLowerCase();
-      const ewtId = pickEwtTaxId(taxMap, item.expense_category, lineGs, entityFlags, extracted);
+      const acctMeta = lineAccountMeta?.[i] || {};
+      const ewtId = pickEwtTaxId(taxMap, item.expense_category, lineGs, entityFlags, extracted, acctMeta.name, acctMeta.code);
       if (ewtId && !lineTaxIds.includes(ewtId)) {
         lineTaxIds = [...lineTaxIds, ewtId];
       }
@@ -2125,7 +2186,8 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
     const hint = extracted?.expense_account_hint || {};
     const singleCat = lineItems[0]?.expense_category || hint.category || "other";
     const singleGs = String(extracted?.vat?.goods_or_services || "").toLowerCase();
-    const singleEwtId = pickEwtTaxId(taxMap, singleCat, singleGs, entityFlags, extracted);
+    const singleAcctMeta = lineAccountMeta?.[0] || {};
+    const singleEwtId = pickEwtTaxId(taxMap, singleCat, singleGs, entityFlags, extracted, singleAcctMeta.name, singleAcctMeta.code);
     let singleTaxIds = [...billLevelTaxIds];
     if (singleEwtId && !singleTaxIds.includes(singleEwtId)) singleTaxIds.push(singleEwtId);
     if (singleTaxIds.length) line.tax_ids = [[6, 0, singleTaxIds]];
@@ -2678,6 +2740,7 @@ async function processOneDocument(args) {
   const lineCount = useLines ? lineItems.length : 1;
   const lineAccountIds = [];
   const lineAccountSources = [];
+  const lineAccountMeta = [];
   for (let i = 0; i < lineCount; i++) {
     const item = useLines ? lineItems[i] : null;
     const category = item?.expense_category || hint.category || "other";
@@ -2703,6 +2766,7 @@ async function processOneDocument(args) {
     });
     lineAccountIds.push(resolved.accountId);
     lineAccountSources.push(resolved.source);
+    lineAccountMeta.push({ code: resolved.accountCode || "", name: resolved.accountName || "" });
     logger.info("Account resolved.", {
       docId: doc.id, line: i, category, lineDesc: lineDesc.slice(0, 40),
       accountId: resolved.accountId, source: resolved.source
@@ -2720,7 +2784,8 @@ async function processOneDocument(args) {
     taxMeta,
     lineAccountIds,
     vendorCountry,
-    entityFlags
+    entityFlags,
+    lineAccountMeta
   );
   
   // Move document to active AP folder if currently archived
