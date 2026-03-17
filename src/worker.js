@@ -2564,15 +2564,23 @@ async function linkDocumentToBill(odoo, companyId, docId, billId, logger, active
   // Ensure accounting folders are active AFTER moving the document to the active AP folder (if it was archived).
   await ensureAccountingFolderActive(odoo, companyId, journalId, logger, originalFolderId);
 
-  // Step 1: Write res_model/res_id fields WITHOUT folder_id.
-  // Odoo's documents_account module has a _compute_folder_id stored computed field that fires
-  // when res_model/res_id change — it moves the document to the journal's folder (Purchase).
-  // Including folder_id here is futile because the compute overrides it within the same transaction.
+  // Step 1: Write ONLY res_model/res_id — deliberately exclude account_move_id/invoice_id.
+  //
+  // Why exclude account_move_id and invoice_id?
+  //   These are Many2one fields to account.move. Odoo's _compute_folder_id has a path
+  //   dependency like @api.depends('account_move_id.journal_id'). Odoo stores this as an
+  //   ir.triggers entry that fires _compute_folder_id on this document every time
+  //   account.move.journal_id is written — even in a future, unrelated transaction.
+  //   When the user opens the draft bill form, Odoo's form auto-save (or any onchange
+  //   that writes journal_id back to the same value) triggers this cross-record recompute,
+  //   moving the document back to the purchase folder.
+  //
+  //   res_model/res_id are Integer/Char — Odoo cannot form path dependencies through them,
+  //   so _compute_folder_id only re-fires if res_model or res_id themselves change.
+  //   This is sufficient for Documents app integration (smart button count, linked record).
   const linkVals = {};
   if (await documentsDocumentHasField(odoo, "res_model")) linkVals.res_model = "account.move";
   if (await documentsDocumentHasField(odoo, "res_id")) linkVals.res_id = Number(billId);
-  if (await documentsDocumentHasField(odoo, "account_move_id")) linkVals.account_move_id = Number(billId);
-  if (await documentsDocumentHasField(odoo, "invoice_id")) linkVals.invoice_id = Number(billId);
 
   if (Object.keys(linkVals).length) {
     await odoo.write("documents.document", [Number(docId)], linkVals);
@@ -2580,7 +2588,8 @@ async function linkDocumentToBill(odoo, companyId, docId, billId, logger, active
 
   // Step 2: Restore folder_id in a SEPARATE write call.
   // Since res_model/res_id are not changing in this write, _compute_folder_id will NOT re-fire,
-  // so this assignment sticks.
+  // so this assignment sticks. And because account_move_id was never written, there is no
+  // account_move_id.journal_id ir.triggers path — future bill saves cannot override this.
   if (originalFolderId) {
     await sleep(300); // small buffer for any async Odoo processing
     await odoo.write("documents.document", [Number(docId)], { folder_id: originalFolderId });
