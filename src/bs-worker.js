@@ -10,7 +10,7 @@ const { validateExtraction, checkDuplicate, checkContinuity, fmtNum } = require(
 const { reconcileStatementLines } = require("./bs-reconcile");
 const { makeProcessedMarker, isProcessed, appendMarker } = require("./markers");
 
-const BS_DOC_FIELDS = ["id", "name", "folder_id", "workspace_id", "attachment_id", "create_uid"];
+const BS_DOC_FIELDS = ["id", "name", "folder_id", "attachment_id", "create_uid"];
 
 function outOfTime(startMs) {
   return Date.now() - startMs > config.budget.runBudgetMs - config.budget.reserveMs;
@@ -176,7 +176,6 @@ async function processBsTarget(target, startMs, logger) {
   // Find BS folder: only process documents in a folder whose name contains "bank"
   // (from task config or auto-detect). If none found, batch run skips this target.
   let folderId = bsFolderId;
-  let workspaceId = null;
 
   if (!folderId) {
     try {
@@ -262,7 +261,7 @@ async function processBsTarget(target, startMs, logger) {
     } catch (err) { tLogger.warn("folder search failed", { error: err?.message }); }
   }
 
-  if (!folderId && !workspaceId) {
+  if (!folderId) {
     return { targetKey, processed: 0, skipped: "no_bank_folder" };
   }
 
@@ -271,8 +270,7 @@ async function processBsTarget(target, startMs, logger) {
     ["is_folder", "=", false],
     ["attachment_id", "!=", false]
   ];
-  if (folderId) docDomain.push(["folder_id", "=", folderId]);
-  else if (workspaceId) docDomain.push(["workspace_id", "=", workspaceId]);
+  docDomain.push(["folder_id", "=", folderId]);
 
   let docs = [];
   try {
@@ -452,7 +450,6 @@ async function processBsDocument({ odoo, companyId, targetKey, doc, logger, conf
   // Match journal
   let folderName = "";
   if (doc.folder_id) folderName = Array.isArray(doc.folder_id) ? doc.folder_id[1] : "";
-  if (doc.workspace_id && !folderName) folderName = Array.isArray(doc.workspace_id) ? doc.workspace_id[1] : "";
   
   const journalResult = await matchBankJournal(odoo, companyId, extracted, {
     folderName,
