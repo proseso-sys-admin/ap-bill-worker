@@ -100,12 +100,13 @@ async function getBsDocEntry(config, docId) {
   return map[String(docId)] || null;
 }
 
-async function persistBsDocMapping(config, docId, journalId, lineIds, targetKey) {
+async function persistBsDocMapping(config, docId, journalId, lineIds, targetKey, statementId = null) {
   if (!config.gcs.stateBucket) return;
   const map = await readJsonObject(config.gcs.stateBucket, bsDocMappingObjectName(config), {});
   map[String(docId)] = {
     journal_id: Number(journalId),
     line_ids: lineIds.map(Number),
+    statement_id: statementId ? Number(statementId) : null,
     target_key: String(targetKey || "").trim(),
     created_at: new Date().toISOString()
   };

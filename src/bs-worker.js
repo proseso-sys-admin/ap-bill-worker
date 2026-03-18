@@ -489,16 +489,36 @@ async function processBsDocument({ odoo, companyId, targetKey, doc, logger, conf
     }
   }
 
+  // Create the bank statement header first so lines are grouped under it.
+  const statementDate = extracted.statement_date_to ||
+                        extracted.statement_date_from ||
+                        new Date().toISOString().slice(0, 10);
+  let statementId = null;
+  try {
+    const stmtVals = {
+      journal_id: journalId,
+      date: statementDate,
+      name: attachment.name || doc.name || `BS ${statementDate}`,
+    };
+    if (extracted.opening_balance != null) stmtVals.balance_start = extracted.opening_balance;
+    if (extracted.closing_balance != null) stmtVals.balance_end_real = extracted.closing_balance;
+    statementId = await odoo.create("account.bank.statement", stmtVals);
+    logger.info("BS: created bank statement header.", { docId, statementId });
+  } catch (err) {
+    logger.warn("BS: failed to create bank statement header; lines will proceed without one.", { docId, error: err?.message });
+  }
+
   // Import statement lines
   const lineIds = [];
   for (const txn of extracted.transactions) {
     try {
       const vals = {
         journal_id: journalId,
-        date: txn.date || extracted.statement_date_to || new Date().toISOString().slice(0, 10),
+        date: txn.date || statementDate,
         amount: txn.amount || 0,
         payment_ref: txn.description || txn.reference || "Bank Transaction"
       };
+      if (statementId) vals.statement_id = statementId;
       const lineId = await odoo.create("account.bank.statement.line", vals);
       lineIds.push(lineId);
     } catch (err) {
@@ -514,7 +534,7 @@ async function processBsDocument({ odoo, companyId, targetKey, doc, logger, conf
   }
 
   // Save mapping
-  await persistBsDocMapping(config, docId, journalId, lineIds, targetKey);
+  await persistBsDocMapping(config, docId, journalId, lineIds, targetKey, statementId);
 
   // Write processed marker
   const marker = makeProcessedMarker(markerPrefix, targetKey, docId, journalId, doc.name || "");
@@ -630,6 +650,16 @@ async function handleBsDocumentDelete(logger, payload) {
         }
       } catch (err) {
         logger.warn("BS delete: failed to remove statement lines.", { docId, error: err?.message });
+      }
+    }
+
+    // Delete the parent statement header if all its lines were removed
+    const statementId = entry.statement_id;
+    if (statementId && !reconciledIds.length) {
+      try {
+        await odoo.executeKw("account.bank.statement", "unlink", [[statementId]], kwWithCompany(target.companyId));
+      } catch (err) {
+        logger.warn("BS delete: failed to remove bank statement header.", { docId, statementId, error: err?.message });
       }
     }
 
