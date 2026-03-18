@@ -1558,7 +1558,13 @@ function extractOcrAmounts(ocrText) {
   const matches = ocrText.match(/[\d,]+\.?\d*/g) || [];
   return matches
     .map((s) => Number(s.replace(/,/g, "")))
-    .filter((n) => n >= 100 && Number.isFinite(n));
+    .filter((n) => {
+      if (!Number.isFinite(n) || n < 100) return false;
+      // Exclude numbers that look like account/reference numbers: more than 8 integer digits
+      // without a decimal point (e.g. bank account "001560006411" → 1560006411)
+      if (n > 99_999_999 && !String(n).includes(".")) return false;
+      return true;
+    });
 }
 
 function isTotalLikeLabel(label) {
@@ -1717,27 +1723,31 @@ function fixExtractedAmounts(extracted, ocrText, logger) {
     }
   }
 
-  // Case H: grand_total ≈ tax_total or vat_amount (picked VAT component as total)
-  if (!correctTotal && grandTotal >= 1) {
+  // Case H: grand_total ≈ tax_total (logically impossible — tax cannot equal total).
+  // This fires unconditionally because grand_total = tax_total is always wrong regardless
+  // of prior correction cases (e.g. Gemini picked the "Total Tax" row instead of TOTAL).
+  if (grandTotal >= 1) {
     const taxTotal = Number(totals.tax_total || 0);
     const vatAmount = Number(extracted?.vat?.vat_amount || 0);
     const vatBase = Number(extracted?.vat?.vatable_base || 0);
     const taxRef = taxTotal || vatAmount;
 
-    if (taxRef > 0 && Math.abs(grandTotal - taxRef) / grandTotal < 0.1) {
+    if (taxRef > 0 && Math.abs(grandTotal - taxRef) / grandTotal < 0.05) {
+      let casehTotal = 0;
       if (vatBase > 0 && vatBase > taxRef) {
-        correctTotal = vatBase + taxRef;
+        casehTotal = vatBase + taxRef;
       } else {
         const bigCandidate = candidates
           .filter((c) => c.amount > grandTotal * 2 && isTotalLikeLabel(c.label))
           .sort((a, b) => b.confidence - a.confidence)[0];
         if (bigCandidate) {
-          correctTotal = bigCandidate.amount;
+          casehTotal = bigCandidate.amount;
         } else {
-          correctTotal = Math.round((taxRef / 0.12) * 1.12 * 100) / 100;
+          casehTotal = Math.round((taxRef / 0.12) * 1.12 * 100) / 100;
         }
       }
-      if (logger) logger.info("Amount correction: grand_total ≈ tax/vat_amount (picked VAT as total).", {
+      correctTotal = casehTotal;
+      if (logger) logger.info("Amount correction: grand_total ≈ tax (picked tax row as total).", {
         geminiTotal: grandTotal, taxRef, vatBase, corrected: correctTotal
       });
     }
