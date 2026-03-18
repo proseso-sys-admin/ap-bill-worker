@@ -262,10 +262,13 @@ async function getTargetsFromOdoo(logger) {
   if (companyIdField) fields.push(companyIdField);
   if (emailField) fields.push(emailField);
   if (passwordField) fields.push(passwordField);
-  const accountingFields = [apFolderField, purchaseJournalField, countryField, twaField].filter(Boolean);
+  // accountingFields: optional Studio fields that may not exist on the source Odoo.
+  // twaField is kept SEPARATE so it survives the fallback retry even if other accounting fields fail.
+  const accountingFields = [apFolderField, purchaseJournalField, countryField].filter(Boolean);
   accountingFields.forEach((f) => {
     if (!fields.includes(f)) fields.push(f);
   });
+  if (twaField && !fields.includes(twaField)) fields.push(twaField);
 
   const domain = [["stage_id.name", "=", stageName]];
   const tasksLimit = Math.max(1, config.routing?.odooTasksLimit ?? 500);
@@ -273,15 +276,25 @@ async function getTargetsFromOdoo(logger) {
   try {
     tasks = await odoo.searchRead("project.task", domain, fields, { limit: tasksLimit });
   } catch (err) {
-    if (accountingFields.length && String(err?.message || "").toLowerCase().includes("invalid field")) {
+    if (String(err?.message || "").toLowerCase().includes("invalid field")) {
+      // Some optional fields don't exist — retry without optional accounting config fields
+      // but keep twaField (critical for EWT) if it's valid.
       const baseFields = fields.filter((f) => !accountingFields.includes(f));
+      const withTwa = twaField ? baseFields : baseFields.filter((f) => f !== twaField);
       try {
-        tasks = await odoo.searchRead("project.task", domain, baseFields, { limit: tasksLimit });
+        tasks = await odoo.searchRead("project.task", domain, withTwa, { limit: tasksLimit });
+        accountingFields.length = 0;
       } catch (err2) {
-        logger.warn("getTargetsFromOdoo: search_read failed.", { error: err2?.message || String(err2) });
-        return [];
+        // twaField itself may be invalid — fall back to bare base fields
+        const bareFields = baseFields.filter((f) => f !== twaField);
+        try {
+          tasks = await odoo.searchRead("project.task", domain, bareFields, { limit: tasksLimit });
+          accountingFields.length = 0;
+        } catch (err3) {
+          logger.warn("getTargetsFromOdoo: search_read failed.", { error: err3?.message || String(err3) });
+          return [];
+        }
       }
-      accountingFields.length = 0;
     } else {
       logger.warn("getTargetsFromOdoo: search_read failed.", { error: err?.message || String(err) });
       return [];
@@ -692,7 +705,7 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
     proprietorName = String(details.proprietor_name || "").trim();
   }
 
-  const name = isSoleProp && proprietorName ? proprietorName : rawName;
+  const name = isSoleProp && tradeName ? tradeName : (proprietorName || rawName);
 
   const searchNames = [name];
   if (rawName.toLowerCase() !== name.toLowerCase()) searchNames.push(rawName);
@@ -743,10 +756,7 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
   if (isSoleProp) {
     vals.company_type = "person";
     vals.is_company = false;
-    if (tradeName) {
-      vals.company_name = tradeName;
-      notes.push(`Trade name: ${tradeName}`);
-    }
+    if (proprietorName) notes.push(`Proprietor: ${proprietorName}`);
     if (typeof details.proprietor_name === "object" && details.proprietor_name !== null) {
       if (details.proprietor_name.first_name) vals.first_name = details.proprietor_name.first_name;
       if (details.proprietor_name.middle_name) vals.middle_name = details.proprietor_name.middle_name;
