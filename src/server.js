@@ -445,11 +445,14 @@ app.post("/webhook/bs-document-upload", async (req, res) => {
         lastError = err;
         const isRace = /not found/i.test(err?.message || "");
         if (!isRace || attempt === retryDelaysMs.length - 1) {
+          logger.error("Webhook bs-document-upload: run-one failed.", { doc_id: docId, attempt: attempt + 1, error: err?.message });
           return res.status(500).json({ ok: false, error: err?.message });
         }
+        logger.warn("Webhook bs-document-upload: transient not-found, retrying.", { doc_id: docId, attempt: attempt + 1, error: err?.message });
       }
     }
     if (lastResult) return res.status(200).json(lastResult);
+    logger.error("Webhook bs-document-upload: all attempts exhausted.", { doc_id: docId, error: lastError?.message });
     return res.status(500).json({ ok: false, error: lastError?.message });
   } finally {
     bsRunOneCount -= 1;
