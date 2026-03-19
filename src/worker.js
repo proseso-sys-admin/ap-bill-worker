@@ -70,8 +70,9 @@ async function pickVatTaxesForCompany(odoo, companyId) {
   // tax_scope is authoritative when set; name heuristics are fallback only
   const hasGoodsScope = (t) => scope(t) === "consu" || scope(t) === "goods";
   const hasServiceScope = (t) => scope(t) === "service";
-  const serviceLike = (t) => (hasServiceScope(t) || has(t, /service|consult|professional|repair|rent|labor|contract|freight/)) && !isCapital(t) && !isNonResident(t);
-  const goodsLike = (t) => (hasGoodsScope(t) || has(t, /goods|supply|material|inventory|product|merch/)) && !isCapital(t) && !isImport(t);
+  // \bS\b / \bG\b catch single-letter shorthand used in PH Odoo setups (e.g. "12% S" / "12% G")
+  const serviceLike = (t) => (hasServiceScope(t) || has(t, /service|consult|professional|repair|rent|labor|contract|freight|\bS\b/i)) && !isCapital(t) && !isNonResident(t);
+  const goodsLike = (t) => (hasGoodsScope(t) || has(t, /goods|supply|material|inventory|product|merch|\bG\b/i)) && !isCapital(t) && !isImport(t);
 
   const pct12 = taxes.filter((t) => t.amount_type === "percent" && Math.abs(Number(t.amount || 0) - 12) < 0.01 && !isWithholding(t));
   const pct0 = taxes.filter((t) => t.amount_type === "percent" && Math.abs(Number(t.amount || 0)) < 0.01 && !isWithholding(t));
@@ -2031,6 +2032,42 @@ function buildBillVals(extracted, vendorId, companyId, taxMap, billLevelTaxIds, 
         const target = invoiceLines[bestIdx][2];
         const qty = target.quantity || 1;
         target.price_unit = Math.round((target.price_unit + diff / qty) * 1e6) / 1e6;
+      }
+    }
+    // VAT reconciliation: redistribute base between VATable and exempt lines so that
+    // Odoo's computed VAT = extracted vat_amount exactly (and total before EWT = grand_total).
+    // This absorbs rounding errors from per-line extraction vs. the receipt's printed VAT field.
+    // Only runs when both VATable and exempt lines exist (the shift is zero-sum on untaxed total).
+    const extractedVatAmt = Number(extracted?.vat?.vat_amount || 0);
+    if (extractedVatAmt > 0 && hasBillTax && taxRate > 0) {
+      const vatableIdxs = [], exemptIdxs = [];
+      for (let i = 0; i < invoiceLines.length; i++) {
+        const lineEntry = invoiceLines[i][2];
+        const taxIds = lineEntry.tax_ids?.[0]?.[2] || [];
+        const isVat = taxIds.some((id) => id === taxMap.goodsId || id === taxMap.servicesId || id === taxMap.genericId);
+        const isExemptLine = taxIds.some((id) => id === taxMap.exemptId || id === taxMap.zeroRatedId);
+        if (isVat) vatableIdxs.push(i);
+        else if (isExemptLine) exemptIdxs.push(i);
+      }
+      if (vatableIdxs.length > 0 && exemptIdxs.length > 0) {
+        const vatableSum = vatableIdxs.reduce((s, i) => {
+          const l = invoiceLines[i][2];
+          return s + l.price_unit * (l.quantity || 1);
+        }, 0);
+        const odooVat = Math.round(vatableSum * (taxRate / 100) * 100) / 100;
+        const vatDiff = Math.round((extractedVatAmt - odooVat) * 100) / 100;
+        if (Math.abs(vatDiff) > 0.01 && Math.abs(vatDiff) < extractedVatAmt * 0.1) {
+          // Shift baseAdj from the last VATable line to the last exempt line (sum stays constant)
+          const baseAdj = vatDiff / (taxRate / 100);
+          const vatLine = invoiceLines[vatableIdxs[vatableIdxs.length - 1]][2];
+          const exemptLine = invoiceLines[exemptIdxs[exemptIdxs.length - 1]][2];
+          // vatLine gets LESS base (add negative baseAdj); exemptLine absorbs it (subtract negative = add)
+          vatLine.price_unit = Math.round((vatLine.price_unit + baseAdj / (vatLine.quantity || 1)) * 1e6) / 1e6;
+          exemptLine.price_unit = Math.round((exemptLine.price_unit - baseAdj / (exemptLine.quantity || 1)) * 1e6) / 1e6;
+          if (logger) logger.info("VAT reconciliation: redistributed base to match receipt VAT.", {
+            odooVat, extractedVatAmt, vatDiff, baseAdj: baseAdj.toFixed(4)
+          });
+        }
       }
     }
   } else {
