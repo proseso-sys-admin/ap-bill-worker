@@ -2490,7 +2490,7 @@ async function processOneDocument(args) {
     });
   }
 
-  let extracted;
+  let extracted, geminiModel;
   if (config.gemini.visionFirst) {
     // Vision OCR and Gemini run concurrently — Gemini reads image directly
     const [ocrResult, geminiResult] = await Promise.allSettled([
@@ -2499,14 +2499,14 @@ async function processOneDocument(args) {
     ]);
     ocrText = ocrResult.status === "fulfilled" ? (ocrResult.value || "") : "";
     if (geminiResult.status === "rejected") throw geminiResult.reason;
-    extracted = geminiResult.value;
+    ({ data: extracted, model: geminiModel } = geminiResult.value);
   } else {
     // Legacy: sequential OCR → Gemini with OCR text in prompt
     ocrText = await ocrTextForAttachment(att, config, logger);
     if (!ocrText || ocrText.trim().length < config.scan.ocrMinTextLen) {
       return { status: "skip", reason: "ocr_too_short" };
     }
-    extracted = await extractInvoiceWithGemini(config, att, userHint, ocrText);
+    ({ data: extracted, model: geminiModel } = await extractInvoiceWithGemini(config, att, userHint, ocrText));
   }
   fixExtractedAmounts(extracted, ocrText, logger);
   let vendor = await findVendor(odoo, companyId, extracted, ocrText);
@@ -2749,7 +2749,7 @@ async function processOneDocument(args) {
     companyId,
     "documents.document",
     doc.id,
-    `✅ <b>🤖 AP Bot:</b> Draft Vendor Bill created: account.move #${billId}<br/>Vendor=${vendor.name || "(unknown)"}`
+    `✅ <b>🤖 AP Bot:</b> Draft Vendor Bill created: account.move #${billId}<br/>Vendor=${vendor.name || "(unknown)"}<br/>Model=${geminiModel || "unknown"}`
   );
 
   {
