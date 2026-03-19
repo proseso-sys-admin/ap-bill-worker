@@ -1799,6 +1799,25 @@ function fixExtractedAmounts(extracted, ocrText, logger) {
     }
   }
 
+  // Case K: grand_total is implausibly large relative to tax_total.
+  // Triggers when Gemini hallucinated the total (e.g. misread a handwritten amount) but
+  // correctly read the VAT amount. For 12% VAT the implied gross = tax/0.12*1.12. If
+  // grand_total is 3x+ that implied gross, the total is wrong.
+  // Uses maxOcr as preferred correction; falls back to the VAT-implied total.
+  // Guard: skip if maxOcr supports the large grand_total (OCR also sees it → probably real).
+  if (!correctTotal && grandTotal >= 1) {
+    const taxTotalK = Number(totals.tax_total || 0);
+    if (taxTotalK > 0) {
+      const impliedGross = Math.round((taxTotalK / 0.12) * 1.12 * 100) / 100;
+      if (impliedGross >= 100 && grandTotal > impliedGross * 3 && !(maxOcr >= grandTotal * 0.8)) {
+        correctTotal = maxOcr > 0 && maxOcr < grandTotal * 0.8 ? maxOcr : impliedGross;
+        if (logger) logger.info("Amount correction: grand_total implausibly large vs tax_total (hallucinated total).", {
+          geminiTotal: grandTotal, taxTotalK, impliedGross, maxOcr, corrected: correctTotal
+        });
+      }
+    }
+  }
+
   // Case G: decimal point misread — grandTotal / 10 or /100 is close to lineSum or a candidate
   if (!correctTotal && grandTotal >= 1000) {
     for (const divisor of [10, 100]) {
