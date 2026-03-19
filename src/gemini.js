@@ -539,8 +539,8 @@ async function extractInvoiceWithGemini(config, attachment, userHint = "", ocrTe
     "{}";
 
   const extracted = safeJsonParse(raw, {});
-  if (!extracted || typeof extracted !== "object") return {};
-  return extracted;
+  if (!extracted || typeof extracted !== "object") return { data: {}, model: result.model };
+  return { data: extracted, model: result.model };
 }
 
 const accountCandidateSchema = {
