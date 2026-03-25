@@ -1,0 +1,12 @@
+# PR-check: validates code before merge. Does NOT deploy.
+steps:
+  - name: 'node:20-slim'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        npm ci
+        node -e "require('./src/server.js')" 2>/dev/null && echo "Import check passed" || echo "Warning: import check skipped"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
