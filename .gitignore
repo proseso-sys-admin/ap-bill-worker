@@ -3,3 +3,4 @@ node_modules/
 cloudrun.env.yaml
 COMMANDS.md
 npm-debug.log*
+*.pdf
