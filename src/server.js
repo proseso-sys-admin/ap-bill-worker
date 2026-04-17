@@ -2,8 +2,10 @@ const express = require("express");
 const { config, validateConfig } = require("./config");
 const { createLogger } = require("./logger");
 const { sleep } = require("./utils");
-const { runWorker, runOne, listApDocuments, collectFeedback, handleDocumentDelete } = require("./worker");
+const { runWorker, runOne, listApDocuments, collectFeedback, handleDocumentDelete, getTargetsFromOdoo } = require("./worker");
 const { runBsWorker, runBsOne, handleBsDocumentDelete } = require("./bs-worker");
+const { OdooClient } = require("./odoo");
+const { attachWebhookRoutes } = require("./webhookRoutes");
 
 const logger = createLogger(config.server.logLevel);
 const app = express();
@@ -50,8 +52,11 @@ app.get("/", (_req, res) => {
   service: "ap-bill-ocr-worker",
   routes: [
     "/health", "/healthz", "/run", "/run-one", "/list-docs", "/debug",
-    "/collect-feedback", "/webhook/document-upload", "/webhook/document-delete", "/webhook/chatter-message",
+    "/collect-feedback",
+    "/webhook/document-upload/:slug", "/webhook/document-delete/:slug", "/webhook/chatter-message/:slug",
+    "/webhook/document-upload", "/webhook/document-delete", "/webhook/chatter-message",
     "/bs/run", "/bs/run-one",
+    "/webhook/bs-document-upload/:slug", "/webhook/bs-document-delete/:slug", "/webhook/bs-chatter-message/:slug",
     "/webhook/bs-document-upload", "/webhook/bs-document-delete", "/webhook/bs-chatter-message"
   ]
 });
@@ -473,6 +478,149 @@ app.post("/webhook/bs-chatter-message", async (req, res) => {
     return res.status(500).json({ ok: false, error: msg });
   } finally {
     bsRunOneCount -= 1;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// New tenant-aware webhook routes: /webhook/<type>/:slug
+// Authenticated via Odoo-callback verification (no URL secret). Old routes
+// above stay live during cutover; remove in Phase 3.
+// ---------------------------------------------------------------------------
+
+function toInt(v, f) { const n = Number.parseInt(String(v ?? ""), 10); return Number.isFinite(n) ? n : f; }
+
+attachWebhookRoutes(app, {
+  getTargets: getTargetsFromOdoo,
+  makeClient: (targetCfg) => new OdooClient(targetCfg),
+  logger,
+  limiterOpts: {
+    ratePerMinute: toInt(process.env.WEBHOOK_RATE_LIMIT_PER_MIN, 60),
+    burst: toInt(process.env.WEBHOOK_RATE_LIMIT_BURST, 60)
+  },
+  handlers: {
+    onDocumentUpload: async ({ target, payload, logger: log }) => {
+      if (isRunning) { const e = new Error("already_running"); e.status = 409; throw e; }
+      const maxConcurrent = config.server.runOneMaxConcurrency || 5;
+      if (runOneCount >= maxConcurrent) { const e = new Error("too_many_concurrent"); e.status = 503; throw e; }
+      const docId = Number(payload.doc_id || 0);
+      const attachmentId = Number(payload.attachment_id || 0);
+      if (!docId && !attachmentId) { const e = new Error("doc_id or attachment_id required"); e.status = 400; throw e; }
+      if (inFlightDocs.has(docId)) return { ok: true, message: "duplicate ignored" };
+      runOneCount += 1;
+      inFlightDocs.add(docId);
+      const retryDelaysMs = [0, 1000, 2000, 2000];
+      let lastResult = null;
+      let lastError = null;
+      try {
+        for (let attempt = 0; attempt < retryDelaysMs.length; attempt++) {
+          if (attempt > 0) await sleep(retryDelaysMs[attempt]);
+          try {
+            lastResult = await runOne({ logger: log, payload: { doc_id: docId, attachment_id: attachmentId, target_key: target.targetKey } });
+            const skipReason = lastResult?.result?.reason;
+            const skip = lastResult?.result?.status === "skip" && (skipReason === "no_attachment" || skipReason === "attachment_not_found");
+            if (!skip) return lastResult;
+            lastError = new Error(`Transient: ${skipReason}`);
+          } catch (err) {
+            lastError = err;
+            const msg = err?.message || String(err);
+            const isRace = /document not found|not found for attachment_id/i.test(msg);
+            if (!isRace || attempt === retryDelaysMs.length - 1) throw err;
+          }
+        }
+        if (lastResult) return lastResult;
+        throw lastError || new Error("retries_exhausted");
+      } finally {
+        runOneCount -= 1;
+        inFlightDocs.delete(docId);
+      }
+    },
+    onDocumentDelete: async ({ target, payload, logger: log }) => {
+      const result = await handleDocumentDelete(log, { ...payload, target_key: target.targetKey });
+      if (result.error === "missing_doc_id") { const e = new Error(result.error); e.status = 400; throw e; }
+      if (result.ok === false && result.error) {
+        const e = new Error(result.error);
+        e.status = result.error === "bill_not_draft" ? 409 : 404;
+        throw e;
+      }
+      return result;
+    },
+    onChatterMessage: async ({ target, payload, logger: log }) => {
+      const maxConcurrent = config.server.runOneMaxConcurrency || 5;
+      if (runOneCount >= maxConcurrent) { const e = new Error("too_many_concurrent"); e.status = 503; throw e; }
+      const docId = Number(payload.doc_id || payload.res_id || 0);
+      if (!docId) { const e = new Error("doc_id required"); e.status = 400; throw e; }
+      runOneCount += 1;
+      try {
+        return await runOne({
+          logger: log,
+          payload: {
+            doc_id: docId,
+            target_key: target.targetKey,
+            message_body: payload.message_body || payload.body || ""
+          }
+        });
+      } finally {
+        runOneCount -= 1;
+      }
+    },
+    onBsDocumentUpload: async ({ target, payload, logger: log }) => {
+      if (isBsRunning) { const e = new Error("already_running"); e.status = 409; throw e; }
+      const maxConcurrent = config.server.runOneMaxConcurrency || 5;
+      if (bsRunOneCount >= maxConcurrent) { const e = new Error("too_many_concurrent"); e.status = 503; throw e; }
+      const docId = Number(payload.doc_id || 0);
+      if (!docId) { const e = new Error("doc_id required"); e.status = 400; throw e; }
+      if (bsInFlightDocs.has(docId)) return { ok: true, message: "duplicate ignored" };
+      bsRunOneCount += 1;
+      bsInFlightDocs.add(docId);
+      const retryDelaysMs = [0, 1000, 2000, 2000];
+      let lastResult = null;
+      let lastError = null;
+      try {
+        for (let attempt = 0; attempt < retryDelaysMs.length; attempt++) {
+          if (attempt > 0) await sleep(retryDelaysMs[attempt]);
+          try {
+            lastResult = await runBsOne({ logger: log, payload: { doc_id: docId, target_key: target.targetKey } });
+            const skipReason = lastResult?.result?.reason;
+            const skip = lastResult?.result?.status === "skip" && (skipReason === "no_attachment" || skipReason === "attachment_not_found");
+            if (!skip) return lastResult;
+            lastError = new Error(`Transient: ${skipReason}`);
+          } catch (err) {
+            lastError = err;
+            const isRace = /not found/i.test(err?.message || "");
+            if (!isRace || attempt === retryDelaysMs.length - 1) throw err;
+          }
+        }
+        if (lastResult) return lastResult;
+        throw lastError || new Error("retries_exhausted");
+      } finally {
+        bsRunOneCount -= 1;
+        bsInFlightDocs.delete(docId);
+      }
+    },
+    onBsDocumentDelete: async ({ target, payload, logger: log }) => {
+      const result = await handleBsDocumentDelete(log, { ...payload, target_key: target.targetKey });
+      if (result.error === "missing_doc_id") { const e = new Error(result.error); e.status = 400; throw e; }
+      return result;
+    },
+    onBsChatterMessage: async ({ target, payload, logger: log }) => {
+      const maxConcurrent = config.server.runOneMaxConcurrency || 5;
+      if (bsRunOneCount >= maxConcurrent) { const e = new Error("too_many_concurrent"); e.status = 503; throw e; }
+      const docId = Number(payload.doc_id || payload.res_id || 0);
+      if (!docId) { const e = new Error("doc_id required"); e.status = 400; throw e; }
+      bsRunOneCount += 1;
+      try {
+        return await runBsOne({
+          logger: log,
+          payload: {
+            doc_id: docId,
+            target_key: target.targetKey,
+            message_body: payload.message_body || payload.body || ""
+          }
+        });
+      } finally {
+        bsRunOneCount -= 1;
+      }
+    }
   }
 });
 
