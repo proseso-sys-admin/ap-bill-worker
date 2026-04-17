@@ -65,8 +65,14 @@ function wrapHandler(handler, logger) {
       return res.status(200).json(result);
     } catch (err) {
       const msg = err?.message || String(err);
-      logger?.error?.("webhook handler failed.", { error: msg, path: req.path });
-      return res.status(500).json({ ok: false, error: msg });
+      const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
+      if (err?.retryAfterSec) res.setHeader("Retry-After", String(err.retryAfterSec));
+      if (status >= 500) {
+        logger?.error?.("webhook handler failed.", { error: msg, path: req.path, status });
+      } else {
+        logger?.info?.("webhook handler rejected.", { error: msg, path: req.path, status });
+      }
+      return res.status(status).json({ ok: false, error: msg });
     }
   };
 }
