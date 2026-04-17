@@ -31,9 +31,9 @@ async function verifyWebhookTenant({ slug, model, id, getTargets, makeClient, lo
 
   let rows;
   try {
-    rows = await client.read(m, [recordId], ["id"]);
+    rows = await client.searchRead(m, [["id", "=", recordId]], ["id"], { limit: 1 });
   } catch (err) {
-    logger?.warn?.("verifyWebhookTenant: Odoo read failed.", { slug: s, model: m, id: recordId, error: err?.message || String(err) });
+    logger?.warn?.("verifyWebhookTenant: Odoo searchRead failed.", { slug: s, model: m, id: recordId, error: err?.message || String(err) });
     return { ok: false, status: 502, reason: "odoo_error" };
   }
 

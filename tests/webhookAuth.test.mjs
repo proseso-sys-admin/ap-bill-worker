@@ -24,7 +24,7 @@ describe("verifyWebhookTenant", () => {
     const targets = [makeTarget("proseso-accounting-test"), makeTarget("other-db")];
     const getTargets = vi.fn().mockResolvedValue(targets);
     const odooRead = vi.fn().mockResolvedValue([{ id: 42 }]);
-    const makeClient = vi.fn().mockReturnValue({ read: odooRead });
+    const makeClient = vi.fn().mockReturnValue({ searchRead: odooRead });
     const logger = makeLogger();
 
     const result = await verifyWebhookTenant({
@@ -38,7 +38,7 @@ describe("verifyWebhookTenant", () => {
 
     expect(result).toEqual({ ok: true, target: targets[0] });
     expect(makeClient).toHaveBeenCalledWith(targets[0].targetCfg);
-    expect(odooRead).toHaveBeenCalledWith("documents.document", [42], ["id"]);
+    expect(odooRead).toHaveBeenCalledWith("documents.document", [["id", "=", 42]], ["id"], { limit: 1 });
   });
 
   it("returns {ok:false, status:404, reason:'unknown_tenant'} when slug does not match any target", async () => {
@@ -64,7 +64,7 @@ describe("verifyWebhookTenant", () => {
     const targets = [makeTarget("proseso-accounting-test")];
     const getTargets = vi.fn().mockResolvedValue(targets);
     const odooRead = vi.fn().mockResolvedValue([]);
-    const makeClient = vi.fn().mockReturnValue({ read: odooRead });
+    const makeClient = vi.fn().mockReturnValue({ searchRead: odooRead });
     const logger = makeLogger();
 
     const result = await verifyWebhookTenant({
@@ -83,7 +83,7 @@ describe("verifyWebhookTenant", () => {
     const targets = [makeTarget("proseso-accounting-test")];
     const getTargets = vi.fn().mockResolvedValue(targets);
     const odooRead = vi.fn().mockRejectedValue(new Error("xmlrpc 500"));
-    const makeClient = vi.fn().mockReturnValue({ read: odooRead });
+    const makeClient = vi.fn().mockReturnValue({ searchRead: odooRead });
     const logger = makeLogger();
 
     const result = await verifyWebhookTenant({
@@ -121,7 +121,7 @@ describe("verifyWebhookTenant", () => {
     const targets = [makeTarget("proseso-accounting-test")];
     const getTargets = vi.fn().mockResolvedValue(targets);
     const odooRead = vi.fn().mockResolvedValue([{ id: 7 }]);
-    const makeClient = vi.fn().mockReturnValue({ read: odooRead });
+    const makeClient = vi.fn().mockReturnValue({ searchRead: odooRead });
     const logger = makeLogger();
 
     const result = await verifyWebhookTenant({
@@ -134,6 +134,6 @@ describe("verifyWebhookTenant", () => {
     });
 
     expect(result.ok).toBe(true);
-    expect(odooRead).toHaveBeenCalledWith("mail.message", [7], ["id"]);
+    expect(odooRead).toHaveBeenCalledWith("mail.message", [["id", "=", 7]], ["id"], { limit: 1 });
   });
 });

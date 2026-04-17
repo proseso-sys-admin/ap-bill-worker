@@ -20,7 +20,7 @@ function makeApp({ targets = makeTargets(["proseso-accounting-test"]), odooRows 
   app.use(express.json());
   const getTargets = vi.fn().mockResolvedValue(targets);
   const read = vi.fn().mockResolvedValue(odooRows);
-  const makeClient = vi.fn().mockReturnValue({ read });
+  const makeClient = vi.fn().mockReturnValue({ searchRead: read });
   const defaultHandlers = {
     onDocumentUpload: vi.fn().mockResolvedValue({ ok: true, mode: "document-upload" }),
     onDocumentDelete: vi.fn().mockResolvedValue({ ok: true, mode: "document-delete" }),
@@ -116,7 +116,7 @@ describe("webhook routes — new /webhook/<type>/:slug form", () => {
 
     expect(res.status).toBe(200);
     expect(handlers.onChatterMessage).toHaveBeenCalledTimes(1);
-    expect(read).toHaveBeenCalledWith("mail.message", [7], ["id"]);
+    expect(read).toHaveBeenCalledWith("mail.message", [["id", "=", 7]], ["id"], { limit: 1 });
   });
 
   it("POST /webhook/bs-document-upload/:slug routes to onBsDocumentUpload", async () => {
