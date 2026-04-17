@@ -11,7 +11,7 @@ function normalizePayload(body, targetKey) {
   };
 }
 
-function makeWebhookMiddleware({ getTargets, makeClient, logger, limiter }) {
+function makeWebhookMiddleware({ getTargets, makeClient, logger, limiter, requireRecord = true }) {
   return async function webhookAuthMiddleware(req, res, next) {
     const slug = String(req.params.slug || "").trim();
     const body = req.body || {};
@@ -30,7 +30,7 @@ function makeWebhookMiddleware({ getTargets, makeClient, logger, limiter }) {
 
     try {
       const verdict = await verifyWebhookTenant({
-        slug, model, id, getTargets, makeClient, logger
+        slug, model, id, getTargets, makeClient, logger, requireRecord
       });
       if (!verdict.ok) {
         return res.status(verdict.status).json({ ok: false, error: verdict.reason });
@@ -71,14 +71,15 @@ function attachWebhookRoutes(app, {
   limiterOpts = { ratePerMinute: 60 }
 }) {
   const limiter = createRateLimiter(limiterOpts);
-  const auth = makeWebhookMiddleware({ getTargets, makeClient, logger, limiter });
+  const authRecord = makeWebhookMiddleware({ getTargets, makeClient, logger, limiter, requireRecord: true });
+  const authTenantOnly = makeWebhookMiddleware({ getTargets, makeClient, logger, limiter, requireRecord: false });
 
-  app.post("/webhook/document-upload/:slug", auth, wrapHandler(handlers.onDocumentUpload, logger));
-  app.post("/webhook/document-delete/:slug", auth, wrapHandler(handlers.onDocumentDelete, logger));
-  app.post("/webhook/chatter-message/:slug", auth, wrapHandler(handlers.onChatterMessage, logger));
-  app.post("/webhook/bs-document-upload/:slug", auth, wrapHandler(handlers.onBsDocumentUpload, logger));
-  app.post("/webhook/bs-document-delete/:slug", auth, wrapHandler(handlers.onBsDocumentDelete, logger));
-  app.post("/webhook/bs-chatter-message/:slug", auth, wrapHandler(handlers.onBsChatterMessage, logger));
+  app.post("/webhook/document-upload/:slug", authRecord, wrapHandler(handlers.onDocumentUpload, logger));
+  app.post("/webhook/document-delete/:slug", authTenantOnly, wrapHandler(handlers.onDocumentDelete, logger));
+  app.post("/webhook/chatter-message/:slug", authRecord, wrapHandler(handlers.onChatterMessage, logger));
+  app.post("/webhook/bs-document-upload/:slug", authRecord, wrapHandler(handlers.onBsDocumentUpload, logger));
+  app.post("/webhook/bs-document-delete/:slug", authTenantOnly, wrapHandler(handlers.onBsDocumentDelete, logger));
+  app.post("/webhook/bs-chatter-message/:slug", authRecord, wrapHandler(handlers.onBsChatterMessage, logger));
 }
 
 module.exports = {

@@ -108,6 +108,39 @@ describe("webhook routes — new /webhook/<type>/:slug form", () => {
     expect(handlers.onDocumentDelete).toHaveBeenCalledTimes(1);
   });
 
+  it("POST /webhook/document-delete/:slug succeeds when record is already gone (unlink fires after delete)", async () => {
+    const { app, handlers, read } = makeApp({ odooRows: [] });
+    const res = await request(app)
+      .post("/webhook/document-delete/proseso-accounting-test")
+      .send({ _id: 2787, _model: "documents.document", id: 2787 });
+
+    expect(res.status).toBe(200);
+    expect(handlers.onDocumentDelete).toHaveBeenCalledTimes(1);
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("POST /webhook/bs-document-delete/:slug succeeds when record is already gone", async () => {
+    const { app, handlers, read } = makeApp({ odooRows: [] });
+    const res = await request(app)
+      .post("/webhook/bs-document-delete/proseso-accounting-test")
+      .send({ _id: 2787, _model: "documents.document", id: 2787 });
+
+    expect(res.status).toBe(200);
+    expect(handlers.onBsDocumentDelete).toHaveBeenCalledTimes(1);
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("POST /webhook/document-delete/:slug still rejects unknown slug with 404", async () => {
+    const { app, handlers } = makeApp();
+    const res = await request(app)
+      .post("/webhook/document-delete/ghost-db")
+      .send({ _id: 42, _model: "documents.document", id: 42 });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("unknown_tenant");
+    expect(handlers.onDocumentDelete).not.toHaveBeenCalled();
+  });
+
   it("POST /webhook/chatter-message/:slug routes to onChatterMessage and verifies mail.message", async () => {
     const { app, handlers, read } = makeApp({ odooRows: [{ id: 7 }] });
     const res = await request(app)

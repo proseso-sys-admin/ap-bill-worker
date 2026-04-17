@@ -117,6 +117,46 @@ describe("verifyWebhookTenant", () => {
     ).toMatchObject({ ok: false, status: 400 });
   });
 
+  it("with requireRecord=false, skips Odoo read and succeeds on tenant match alone", async () => {
+    const targets = [makeTarget("proseso-accounting-test")];
+    const getTargets = vi.fn().mockResolvedValue(targets);
+    const odooRead = vi.fn();
+    const makeClient = vi.fn().mockReturnValue({ searchRead: odooRead });
+    const logger = makeLogger();
+
+    const result = await verifyWebhookTenant({
+      slug: "proseso-accounting-test",
+      model: "documents.document",
+      id: 2787,
+      getTargets,
+      makeClient,
+      logger,
+      requireRecord: false
+    });
+
+    expect(result).toEqual({ ok: true, target: targets[0] });
+    expect(makeClient).not.toHaveBeenCalled();
+    expect(odooRead).not.toHaveBeenCalled();
+  });
+
+  it("with requireRecord=false, still rejects unknown tenant slug with 404", async () => {
+    const getTargets = vi.fn().mockResolvedValue([makeTarget("proseso-accounting-test")]);
+    const makeClient = vi.fn();
+    const logger = makeLogger();
+
+    const result = await verifyWebhookTenant({
+      slug: "ghost-db",
+      model: "documents.document",
+      id: 2787,
+      getTargets,
+      makeClient,
+      logger,
+      requireRecord: false
+    });
+
+    expect(result).toMatchObject({ ok: false, status: 404, reason: "unknown_tenant" });
+  });
+
   it("accepts mail.message model and verifies the message record", async () => {
     const targets = [makeTarget("proseso-accounting-test")];
     const getTargets = vi.fn().mockResolvedValue(targets);
