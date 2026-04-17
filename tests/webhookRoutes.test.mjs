@@ -204,4 +204,43 @@ describe("webhook routes — new /webhook/<type>/:slug form", () => {
       .send({ _id: 42, _model: "documents.document", id: 42 });
     expect(res.status).toBe(500);
   });
+
+  it("respects err.status on thrown handler error (409 already_running)", async () => {
+    const err = new Error("already_running");
+    err.status = 409;
+    const { app } = makeApp({
+      handlers: { onDocumentUpload: vi.fn().mockRejectedValue(err) }
+    });
+    const res = await request(app)
+      .post("/webhook/document-upload/proseso-accounting-test")
+      .send({ _id: 42, _model: "documents.document", id: 42 });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("already_running");
+  });
+
+  it("respects err.status 503 with Retry-After header when handler sets it", async () => {
+    const err = new Error("too_many_concurrent");
+    err.status = 503;
+    err.retryAfterSec = 30;
+    const { app } = makeApp({
+      handlers: { onDocumentUpload: vi.fn().mockRejectedValue(err) }
+    });
+    const res = await request(app)
+      .post("/webhook/document-upload/proseso-accounting-test")
+      .send({ _id: 42, _model: "documents.document", id: 42 });
+    expect(res.status).toBe(503);
+    expect(res.headers["retry-after"]).toBe("30");
+  });
+
+  it("respects err.status 400 on handler validation error", async () => {
+    const err = new Error("doc_id required");
+    err.status = 400;
+    const { app } = makeApp({
+      handlers: { onDocumentUpload: vi.fn().mockRejectedValue(err) }
+    });
+    const res = await request(app)
+      .post("/webhook/document-upload/proseso-accounting-test")
+      .send({ _id: 42, _model: "documents.document", id: 42 });
+    expect(res.status).toBe(400);
+  });
 });
