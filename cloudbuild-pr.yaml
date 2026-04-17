@@ -5,8 +5,10 @@ steps:
     args:
       - '-c'
       - |
+        set -euo pipefail
         npm ci
-        node -e "require('./src/server.js')" 2>/dev/null && echo "Import check passed" || echo "Warning: import check skipped"
+        npm run check
+        npm test
 
 options:
   logging: CLOUD_LOGGING_ONLY
