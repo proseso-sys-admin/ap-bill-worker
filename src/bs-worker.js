@@ -341,7 +341,14 @@ async function runBsOne({ logger, payload = {} }) {
     }
   }
 
-  if (!target) throw new Error(`No matching BS target found for doc_id ${docId}`);
+  if (!target) {
+    // BS chatter rule fires on every @bot comment on documents.document regardless
+    // of folder, so AP-folder docs will hit this handler. Skip gracefully instead
+    // of throwing — avoids noisy 500s. Real BS docs with no matching tenant will
+    // still surface via /bs/run-one logs.
+    logger.info("runBsOne: doc is not in any bank folder across known BS targets; skipping.", { docId });
+    return { ok: true, mode: "bs-run-one", docId, result: { status: "skip", reason: "not_a_bs_doc" } };
+  }
 
   const { targetKey, targetCfg, companyId } = target;
   const odoo = new OdooClient(targetCfg);

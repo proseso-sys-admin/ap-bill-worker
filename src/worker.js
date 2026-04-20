@@ -690,7 +690,7 @@ async function findVendor(odoo, companyId, extracted, ocrText) {
   };
 }
 
-async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
+async function createVendorIfMissing(odoo, companyId, extracted, ocrText, defaultCountry = "") {
   const picked = pickVendorFromExtraction(extracted, ocrText);
   const rawName = String(picked.name || "").trim();
   const conf = Number(picked.confidence || 0);
@@ -745,6 +745,25 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText) {
     if (details.address.zip) vals.zip = String(details.address.zip).trim().slice(0, 255);
   } else if (String(details.address || "").trim()) {
     vals.street = String(details.address).trim().slice(0, 255);
+  }
+
+  // country_id fallback: extracted.address.country → target's country.
+  // Tenants with "Require Fields on Contact" automation (e.g. klaro-ventures) reject
+  // res.partner writes that lack country_id, so we must always supply one.
+  const extractedCountry = (typeof details.address === "object" && details.address)
+    ? String(details.address.country || "").trim()
+    : "";
+  const countryName = extractedCountry || String(defaultCountry || "").trim();
+  if (countryName) {
+    try {
+      const countryRows = await odoo.searchRead(
+        "res.country",
+        [["name", "ilike", countryName]],
+        ["id", "name"],
+        { limit: 1 }
+      );
+      if (countryRows?.[0]?.id) vals.country_id = Number(countryRows[0].id);
+    } catch (_) { /* country lookup is best-effort */ }
   }
 
   if (String(details.tin || "").trim()) {
@@ -2613,7 +2632,7 @@ async function processOneDocument(args) {
   fixExtractedAmounts(extracted, ocrText, logger);
   let vendor = await findVendor(odoo, companyId, extracted, ocrText);
   if (!vendor.id) {
-    const createdVendor = await createVendorIfMissing(odoo, companyId, extracted, ocrText);
+    const createdVendor = await createVendorIfMissing(odoo, companyId, extracted, ocrText, entityFlags?.country || "");
     if (createdVendor.partnerId) {
       vendor = {
         id: Number(createdVendor.partnerId),
