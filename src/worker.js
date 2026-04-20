@@ -2612,7 +2612,11 @@ async function processOneDocument(args) {
   }
 
   let extracted, geminiModel;
-  if (config.gemini.visionFirst) {
+  if (config.gemini.skipVision) {
+    // Gemini-only mode — no Cloud Vision OCR, Gemini reads image/PDF directly
+    ({ data: extracted, model: geminiModel } = await extractInvoiceWithGemini(config, att, userHint));
+    ocrText = "";
+  } else if (config.gemini.visionFirst) {
     // Vision OCR and Gemini run concurrently — Gemini reads image directly
     const [ocrResult, geminiResult] = await Promise.allSettled([
       ocrTextForAttachment(att, config, logger),
