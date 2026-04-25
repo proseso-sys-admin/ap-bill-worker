@@ -24,6 +24,7 @@ const {
   parseOcrJobMarker
 } = require("./markers");
 const { stripExampleContext } = require("./ocrFilters");
+const { createVendorWithPlaceholderTin } = require("./placeholderTin");
 
 function outOfTime(startMs) {
   return Date.now() - startMs > config.budget.runBudgetMs - config.budget.reserveMs;
@@ -747,9 +748,11 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText, defaul
     vals.street = String(details.address).trim().slice(0, 255);
   }
 
-  // country_id fallback: extracted.address.country → target's country.
+  // country_id resolution — extracted.address.country -> defaultCountry.
   // Tenants with "Require Fields on Contact" automation (e.g. klaro-ventures) reject
-  // res.partner writes that lack country_id, so we must always supply one.
+  // res.partner writes lacking country_id, so we must always supply one and know
+  // whether the partner is PH (drives vat/first_name/last_name requirements).
+  let isPH = false;
   const extractedCountry = (typeof details.address === "object" && details.address)
     ? String(details.address.country || "").trim()
     : "";
@@ -759,10 +762,13 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText, defaul
       const countryRows = await odoo.searchRead(
         "res.country",
         [["name", "ilike", countryName]],
-        ["id", "name"],
+        ["id", "name", "code"],
         { limit: 1 }
       );
-      if (countryRows?.[0]?.id) vals.country_id = Number(countryRows[0].id);
+      if (countryRows?.[0]?.id) {
+        vals.country_id = Number(countryRows[0].id);
+        isPH = String(countryRows[0].code || "").toUpperCase() === "PH";
+      }
     } catch (_) { /* country lookup is best-effort */ }
   }
 
@@ -799,80 +805,133 @@ async function createVendorIfMissing(odoo, companyId, extracted, ocrText, defaul
     }
   }
   if (notes.length) vals.comment = notes.join("\n");
+
+  // Pre-validator (mirrors canonical require_fields_contact.py).
+  // Backfill required fields with placeholders so canonical automation passes;
+  // bill caller surfaces the backfilled fields in chatter for human review.
+  const backfilled = [];
+
+  if (!vals.street) { vals.street = "N/A"; backfilled.push("street"); }
+  if (!vals.city) { vals.city = "N/A"; backfilled.push("city"); }
+
+  if (!vals.country_id) {
+    try {
+      const phRows = await odoo.searchRead(
+        "res.country",
+        [["code", "=", "PH"]],
+        ["id"],
+        { limit: 1 }
+      );
+      if (phRows?.[0]?.id) {
+        vals.country_id = Number(phRows[0].id);
+        backfilled.push("country_id");
+        isPH = true;
+      }
+    } catch (_) { /* best-effort */ }
+  }
+
+  // Canonical rule: PH non-company partners require first_name + last_name.
+  if (isPH && isSoleProp) {
+    if (!vals.first_name) { vals.first_name = "Pending"; backfilled.push("first_name"); }
+    if (!vals.last_name) { vals.last_name = "Review"; backfilled.push("last_name"); }
+  }
+
+  // Create with placeholder-TIN allocation when needed.
+  const needsPlaceholderTin = isPH && !vals.vat;
+  let placeholderTinUsed = null;
   let newId;
 
-  const createWithFallback = async (payload) => {
-    let currentPayload = { ...payload };
-    try {
-      return await odoo.create("res.partner", currentPayload);
-    } catch (e) {
-      const errMsg = String(e?.message || "");
-      if (errMsg.includes("company_type") || errMsg.includes("is_company")) {
-        delete currentPayload.company_type;
-        currentPayload.is_company = !isSoleProp;
-        try {
-          return await odoo.create("res.partner", currentPayload);
-        } catch (e2) {
-          delete currentPayload.is_company;
-          return await odoo.create("res.partner", currentPayload);
-        }
-      }
-      throw e;
+  // Strip-on-error helper for "Invalid field X on model" errors signaling the
+  // field doesn't exist on this Odoo install. Intentionally narrow regex AVOIDS
+  // matching the canonical "fields are required" error, which the outer catch
+  // handles separately by routing to needs_confirmation.
+  const stripUnknownFields = (currentVals, errMsg) => {
+    const next = { ...currentVals };
+    let stripped = false;
+    if (/Invalid field.*['"`]?(first_name|middle_name|last_name)['"`]?/i.test(errMsg)
+        || /Field.*(does not exist|is not defined).*(first_name|middle_name|last_name)/i.test(errMsg)) {
+      delete next.first_name; delete next.middle_name; delete next.last_name;
+      stripped = true;
     }
+    if (/Invalid field.*['"`]?branch_code['"`]?/i.test(errMsg)
+        || /Field.*(does not exist|is not defined).*branch_code/i.test(errMsg)) {
+      delete next.branch_code;
+      stripped = true;
+    }
+    if (/Invalid field.*['"`]?(company_type|is_company|company_name)['"`]?/i.test(errMsg)
+        || /Field.*(does not exist|is not defined).*(company_type|is_company|company_name)/i.test(errMsg)) {
+      delete next.company_type; delete next.is_company; delete next.company_name;
+      stripped = true;
+    }
+    return stripped ? next : null;
+  };
+
+  const tryCreate = async (currentVals) => {
+    if (needsPlaceholderTin) {
+      const r = await createVendorWithPlaceholderTin(odoo, currentVals);
+      placeholderTinUsed = r.vat;
+      if (!backfilled.includes("vat")) backfilled.push("vat");
+      return r.id;
+    }
+    return await odoo.create("res.partner", currentVals);
   };
 
   try {
-    vals.company_type = isSoleProp ? "person" : "company";
-    newId = await createWithFallback(vals);
+    newId = await tryCreate(vals);
   } catch (e) {
     const errMsg = String(e?.message || "");
-    let retry = false;
 
-    if (errMsg.includes("first_name") || errMsg.includes("middle_name") || errMsg.includes("last_name")) {
-      delete vals.first_name;
-      delete vals.middle_name;
-      delete vals.last_name;
-      retry = true;
-    }
-    if (errMsg.includes("company_name")) {
-      delete vals.company_name;
-      retry = true;
-    }
-    if (errMsg.includes("branch_code")) {
-      delete vals.branch_code;
-      retry = true;
+    // Canonical UserError from "Require Fields on Contact" automation.
+    // Even with backfills, a client may add custom required fields; route those
+    // to needs_confirmation rather than guessing more placeholders.
+    const canonical = errMsg.match(/The following fields are required:\s*([^\n]+)/i);
+    if (canonical) {
+      return {
+        status: "needs_confirmation",
+        partnerId: 0,
+        created: false,
+        name: rawName,
+        reason: "canonical_validation_failed",
+        missing: canonical[1].trim(),
+      };
     }
 
-    if (retry) {
-      try {
-        newId = await createWithFallback(vals);
-      } catch (e2) {
-        const errMsg2 = String(e2?.message || "");
-        let retry2 = false;
-        if (errMsg2.includes("branch_code")) {
-          delete vals.branch_code;
-          retry2 = true;
-        }
-        if (errMsg2.includes("first_name") || errMsg2.includes("middle_name") || errMsg2.includes("last_name")) {
-          delete vals.first_name;
-          delete vals.middle_name;
-          delete vals.last_name;
-          retry2 = true;
-        }
-        if (retry2) {
-          newId = await createWithFallback(vals);
-        } else {
-          throw e2;
-        }
+    // Field-doesn't-exist on this DB -> strip and retry once.
+    const retryVals = stripUnknownFields(vals, errMsg);
+    if (!retryVals) throw e;
+
+    try {
+      newId = await tryCreate(retryVals);
+    } catch (e2) {
+      const errMsg2 = String(e2?.message || "");
+      const canonical2 = errMsg2.match(/The following fields are required:\s*([^\n]+)/i);
+      if (canonical2) {
+        return {
+          status: "needs_confirmation",
+          partnerId: 0,
+          created: false,
+          name: rawName,
+          reason: "canonical_validation_failed",
+          missing: canonical2[1].trim(),
+        };
       }
-    } else {
-      throw e;
+      const retryVals2 = stripUnknownFields(retryVals, errMsg2);
+      if (!retryVals2) throw e2;
+      newId = await tryCreate(retryVals2);
     }
   }
 
   return {
-    status: "created", partnerId: Number(newId), created: true, name,
-    entityType, tradeName, proprietorName
+    status: "created",
+    partnerId: Number(newId),
+    created: true,
+    name,
+    entityType,
+    tradeName,
+    proprietorName,
+    backfilled: backfilled.length
+      ? { fields: backfilled, placeholderTin: placeholderTinUsed }
+      : null,
   };
 }
 
@@ -2645,12 +2704,20 @@ async function processOneDocument(args) {
         source: extracted?.vendor?.source || "unknown",
         created: !!createdVendor.created
       };
+      let backfillNote = "";
+      if (createdVendor.backfilled?.fields?.length) {
+        const fields = createdVendor.backfilled.fields.join(", ");
+        const tin = createdVendor.backfilled.placeholderTin
+          ? ` (placeholder TIN: ${createdVendor.backfilled.placeholderTin})`
+          : "";
+        backfillNote = `\n⚠️ Backfilled fields: ${fields}${tin}\nPlease review and update before posting.`;
+      }
       await safeMessagePost(
         odoo,
         companyId,
         "documents.document",
         doc.id,
-        `✅ Vendor auto-${createdVendor.created ? "created" : "matched"}: ${vendor.name} (#${vendor.id}).`
+        `✅ Vendor auto-${createdVendor.created ? "created" : "matched"}: ${vendor.name} (#${vendor.id}).${backfillNote}`
       );
     } else {
       await safeMessagePost(
@@ -3725,5 +3792,6 @@ module.exports = {
   getRoutingSummary,
   collectFeedback,
   handleDocumentDelete,
-  getTargetsFromOdoo
+  getTargetsFromOdoo,
+  createVendorIfMissing,
 };
