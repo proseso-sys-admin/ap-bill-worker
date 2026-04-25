@@ -23,18 +23,18 @@ When a user bulk-uploads N invoices simultaneously, Odoo fans out N parallel web
 - **No 503s reach Odoo.** The ingestion endpoint must always return 2xx for valid payloads, even under burst.
 - **No docs are silently lost.** Every accepted doc either becomes a draft `account.move`, posts a chatter explaining why it can't, or lands in a dead-letter queue with operator visibility.
 - **Loose fairness across tenants.** A single tenant's 100-doc bulk upload should not starve a different tenant's 5-doc upload.
-- **Visible early progress under bulk.** With a 100-doc upload, the operator should see the first ~30 bills land within ~80 seconds; the rest can take up to 30 minutes.
+- **Visible early progress under bulk.** With a 100-doc upload, the operator should see bills appearing in chatter as they're processed — no minutes-long stalls where nothing seems to be happening. Per-doc latency varies with invoice complexity; that's acceptable.
 - **Survive deploys mid-batch.** A deploy in the middle of a 100-doc batch should not lose any in-flight docs.
-- **No per-doc real-time SLA.** Eventual consistency is acceptable.
+- **Reduce Gemini Pro RPM pressure.** Route docs to Flash by default and escalate to Pro only when Flash returns low-confidence output; this multiplies effective throughput and gives headroom for traffic growth.
 
 ## 3. Non-goals
 
 - **No queue-per-tenant.** Loose fairness via worker-side semaphores is sufficient; we explicitly chose not to provision 30+ Cloud Tasks queues.
 - **No global semaphore via Redis/Memorystore.** Per-instance fairness is good enough; standing up Memorystore is not justified by current scale.
 - **No automated DLQ replay.** Poison messages need human review before re-dispatch.
-- **No Gemini Flash fallback in this scope.** Flash-first model routing is a separate (orthogonal) optimization tracked as a future task.
-- **No change to `runOne` or `processOneDocument`.** This is purely an ingestion/dispatch layer; existing extraction logic is unchanged.
+- **No change to `runOne` or `processOneDocument`'s bill-creation logic.** The queue layer wraps existing logic; the only edit inside `processOneDocument` is the Flash → Pro escalation in the Gemini-call path.
 - **No retirement of `/webhook/document-upload/:slug` in this scope.** It stays as a fallback during and after cutover.
+- **No per-doc real-time SLA.** Eventual consistency is acceptable; processing time scales with invoice complexity.
 
 ## 4. Architecture
 
@@ -133,6 +133,27 @@ The DLQ is a separate Cloud Tasks queue. Tasks are routed there automatically wh
 
 **Rollback:** the same script with `--revert` flag swaps the URL back.
 
+### 5.6 `src/gemini.js` — Flash-first model routing (additive, in-place)
+
+**Responsibility:** call Gemini Flash for the first extraction pass; if Flash returns low confidence or specific failure shapes, escalate the same payload to Gemini Pro.
+
+**Surface area:** modifies the existing `extractInvoiceWithGemini` function to consult two env vars already wired through `config`:
+- `GEMINI_MODEL` → primary model, defaulted to `gemini-2.5-flash` (was Pro)
+- `GEMINI_FALLBACK_MODEL` → escalation model, defaulted to `gemini-3-pro-preview`
+
+**Escalation triggers (any one):**
+1. Flash response missing required schema fields (e.g., `vendor.name` empty, `invoice.grand_total` empty)
+2. Any field's `confidence` < `ESCALATE_CONFIDENCE_THRESHOLD` (default 0.7)
+3. Flash returned a 4xx/5xx error other than 429 (treat as model-incompatible, not transient)
+
+**On 429 from Flash:** do NOT escalate to Pro (that just shifts pressure between quotas). Instead, throw a quota error so `taskHandler.classifyError` returns 429 → Cloud Tasks retries with backoff.
+
+**Logging:** emit a structured log entry per call indicating which model produced the final result and whether escalation happened. This becomes the rate-of-escalation metric — if escalation rises above ~20%, the threshold is too aggressive.
+
+**Configuration:** all thresholds and model names go through `config.js`, no hardcoded values. Each tenant uses the same defaults; per-tenant overrides are out of scope for v1.
+
+**Why this is in scope despite being orthogonal to the queue:** it's the *quota* answer to the same problem the queue addresses (handling load). Building the queue without Flash routing leaves Gemini Pro RPM as the silent ceiling under sustained load. With Flash-first, the queue's `max_concurrent_dispatches=30` doesn't bump into Gemini quota until ~5x the current ceiling.
+
 ## 6. Error handling & observability
 
 ### 6.1 `classifyError` helper
@@ -186,8 +207,9 @@ No automated DLQ-replay. Replay is intentional — poison messages need human ey
 - **`tests/taskHandler.test.mjs`**: posts to `/task/run-one/:slug` with mocked OIDC validation. Mocks `runOne` to return each result class (`ok`, `skip`, throws). Asserts the status mapping table from §5.2.
 - **`tests/tenantSemaphore.test.mjs`**: pure-function tests on acquire/release/inFlight. Covers cap behavior, release-without-acquire, slug isolation, snapshot consistency.
 - **`tests/classifyError.test.mjs`**: ~20 realistic error message strings → expected `{status, retry, reason}`. Regression-defense for regex specificity.
+- **`tests/geminiRouting.test.mjs`**: mocks Flash and Pro responses to cover §5.6 escalation triggers — Flash returns full schema (no escalation), Flash returns missing field (escalates), Flash returns low-confidence (escalates), Flash returns 429 (does NOT escalate, throws quota error). Asserts the structured log entry includes which model produced the final result.
 
-Coverage target: ≥90% on the four new modules. Existing `worker.js` test suite is unchanged because `runOne` is unchanged.
+Coverage target: ≥90% on the new and modified modules. The existing `worker.js` test suite stays green because `runOne` and `processOneDocument` are unchanged outside of the Gemini call.
 
 ### 7.2 Integration test (Cloud Tasks emulator)
 
@@ -214,15 +236,19 @@ Rollback: `scripts/cutover-tenant-to-tasks.js --revert <slug>` reverts the Odoo 
 
 ## 8. Migration & rollout
 
-**Phase 1 (PR #1):** Add `/task/run-one/:slug` endpoint with OIDC validation, `tenantSemaphore` module, `classifyError` helper, all unit tests. No Cloud Tasks integration yet — endpoint is callable but nothing produces tasks. Tested via `gcloud tasks create-http-task --queue=ap-worker-bills`.
+Phasing = how we split the work into independently shippable PRs. After each phase, the system is in a working state — pausing between phases leaves nothing broken. PR-level boundaries:
 
-**Phase 2 (PR #2):** Add `/enqueue/:slug` proxy endpoint, Terraform for queue + DLQ + invoker SA, `cutover-tenant-to-tasks.js` script, integration test. Cut over **proseso-accounting-test only**. Soak 24 hours.
+**Phase 0 (PR #1) — Gemini Flash-first routing.** Modify `extractInvoiceWithGemini` (§5.6) to call Flash by default and escalate to Pro on low confidence. Self-contained; lands before queue work. Rollback is a one-line env-var change. Production effect: per-doc latency drops on simple bills (Flash is faster), Pro RPM pressure drops by ~5x on aggregate.
 
-**Phase 3 (PR #3):** After 24-hour soak with no anomalies, run the cutover script for all remaining 30+ tenants. Monitor queue depth and DLQ for 1 week. After clean operation, document the architecture in CLAUDE.md and remove this spec's "draft" status.
+**Phase 1 (PR #2) — Queue consumer endpoint, dormant.** Add `/task/run-one/:slug` endpoint with OIDC validation, `tenantSemaphore` module, `classifyError` helper, all unit tests. **No Cloud Tasks integration yet** — endpoint is callable but nothing produces tasks. Tested via `gcloud tasks create-http-task --queue=ap-worker-bills`. Production effect: zero (endpoint is dormant).
 
-**Phase 4 (deferred):** Retire `/webhook/document-upload/:slug` after 30 days of clean operation. (Out of scope for this spec.)
+**Phase 2 (PR #3) — Single-tenant cutover.** Add `/enqueue/:slug` proxy endpoint, Terraform for queue + DLQ + invoker SA, `cutover-tenant-to-tasks.js` script, integration test. Cut over **proseso-accounting-test only**. Other 30 tenants stay on `/webhook/document-upload/:slug`. Soak 24 hours. Rollback: `cutover-tenant-to-tasks.js --revert proseso-accounting-test`.
 
-Each phase is independently shippable. Phase 1 alone is risk-free (additive, no production behavior change). Phase 2 affects one test client. Phase 3 is the wide cutover with explicit per-tenant rollback.
+**Phase 3 (PR #4) — Wide cutover.** After 24-hour soak with no anomalies, run the cutover script for all remaining 30+ tenants. Monitor queue depth and DLQ for 1 week. After clean operation, document the architecture in CLAUDE.md and remove this spec's "draft" status.
+
+**Phase 4 (deferred, separate spec) — Retire `/webhook/document-upload/:slug`.** After 30 days of clean operation. Not in this spec.
+
+Each phase is independently shippable and independently revertible. Phases 0 and 1 are risk-free (additive, no behavior change for existing traffic). Phase 2 affects one test client. Phase 3 is the wide cutover with explicit per-tenant rollback.
 
 ## 9. Open questions / known limitations
 
@@ -231,6 +257,8 @@ Each phase is independently shippable. Phase 1 alone is risk-free (additive, no 
 - **`/debug` endpoint exposure.** `tenantSemaphore.inFlight()` reveals tenant slugs. The endpoint must keep its existing `isAuthorized` guard.
 - **No DLQ replay automation.** Operator burden grows linearly with poison message volume. Acceptable today (~0 expected per week) but worth revisiting if it spikes.
 - **Cloud Tasks regional locality.** The queue is in `asia-southeast1`, same region as the worker. Cross-region dispatch would add latency; we're not doing that.
+- **Flash → Pro escalation rate is unknown a priori.** §5.6 sets `ESCALATE_CONFIDENCE_THRESHOLD = 0.7` as a guess. Real escalation rate will only be visible after Phase 0 ships. If escalation > 40% on real traffic, Flash isn't pulling its weight and we should revisit (either tune the threshold, switch back to Pro-default, or improve prompts).
+- **Per-tenant Flash/Pro override is out of scope.** All tenants use the same defaults. If a specific client's invoice quality consistently produces low-confidence Flash results, manual config is the workaround until per-tenant routing is added.
 
 ## 10. References
 
