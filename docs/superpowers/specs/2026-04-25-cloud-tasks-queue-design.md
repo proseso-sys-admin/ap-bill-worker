@@ -64,6 +64,8 @@ Cloud Tasks queue ap-worker-bills
 
 **Per-tenant semaphore is per-Cloud-Run-instance, not global.** With `maxScale=10` and `cap=3`, the global per-tenant ceiling is 30 in-flight — well within Cloud Run's `runOneMaxConcurrency=5` × 10 instances = 50 total budget.
 
+**Single-tenant throughput trade-off (loose fairness consequence).** When one tenant has 100 tasks queued and no other tenant is active, Cloud Tasks delivers up to its `max_concurrent_dispatches=30` to the worker. The worker semaphore caps that tenant to 3, so 27 of the 30 dispatched tasks return 429 and re-enter the queue with `min_backoff=30s`. The cycle is: 3 tasks complete (~80s), Cloud Tasks redelivers another batch, 3 of those proceed, the rest 429 again. Effective throughput for a single bursting tenant is roughly 3 docs per ~30-90s cycle — about **6-8 docs/min**, so 100 docs takes **~15-20 min wall time**. This is intentional under loose fairness (requirement C in the brainstorm): no single tenant can monopolize all 30 slots. If a different tenant has 5 tasks during the burst, those 5 get their own 3 slots concurrently and finish in ~80-160s independently of the 100-doc tenant. Acceptable for the stated goal of "visible early progress, eventual completion".
+
 **The existing `/webhook/document-upload/:slug` endpoint stays.** Cutover happens per-tenant by changing the Odoo automation's `webhook_url`. Reverting a tenant is a one-field Odoo write.
 
 ## 5. Components
@@ -84,7 +86,7 @@ Cloud Tasks queue ap-worker-bills
 
 **Interface:** Express handler `handleTaskRunOne(req, res)`, mounted at `POST /task/run-one/:slug`.
 
-**Dependencies:** `google-auth-library` (`OAuth2Client.verifyIdToken`), `runOne` from `worker.js` (unchanged), `tenantSemaphore` module (§5.3), `classifyError` helper (§6.1), the existing slug-to-target-key resolver used by `attachWebhookRoutes` today (so the routing source of truth stays in one place).
+**Dependencies:** `google-auth-library` (`OAuth2Client.verifyIdToken`), `runOne` from `worker.js` (unchanged), `tenantSemaphore` module (§5.3), `classifyError` helper (§6.1), and `resolveSlugToTargetKey` from §5.7 (extracted from current webhook middleware so the routing source of truth stays in one place).
 
 **Status mapping (load-bearing):**
 
@@ -110,15 +112,23 @@ Cloud Tasks queue ap-worker-bills
 
 **Dependencies:** none. Pure in-memory `Map<string, number>`.
 
-### 5.4 `terraform/cloud_tasks.tf` — infrastructure
+### 5.4 `terraform/cloud_tasks.tf` + `terraform/cloud_tasks_alerts.tf` — infrastructure
 
-Resources:
+**`cloud_tasks.tf` (queue + IAM):**
 - `google_cloud_tasks_queue.ap_worker_bills` — main queue with rate config from §4
 - `google_cloud_tasks_queue.ap_worker_bills_dlq` — dead-letter queue
 - `google_service_account.cloud_tasks_invoker` — service account whose OIDC token signs requests to the worker
 - `google_cloud_run_service_iam_member` — grants `cloud_tasks_invoker` the `roles/run.invoker` role on the worker service
 
 The DLQ is a separate Cloud Tasks queue. Tasks are routed there automatically when `max_attempts` is reached on the main queue.
+
+**`cloud_tasks_alerts.tf` (monitoring, ships with the queue):**
+- `google_monitoring_notification_channel.operator_email` — email channel for the operator (`joseph@proseso-consulting.com`)
+- `google_monitoring_alert_policy.oldest_task_age` — fires when `cloudtasks.googleapis.com/queue/oldest_task_age` on `ap-worker-bills` exceeds 3600s (1 hour). This is the primary "ingestion is broken" signal.
+- `google_monitoring_alert_policy.dlq_depth` — fires when `cloudtasks.googleapis.com/queue/depth` on `ap-worker-bills-dlq` exceeds 5. Surfaces operator-attention items without polling the console.
+- `google_monitoring_alert_policy.queue_depth_sustained` — fires when `cloudtasks.googleapis.com/queue/depth` on `ap-worker-bills` exceeds 50 for 30 minutes. Catches "queue is filling faster than it drains" before `oldest_task_age` would.
+
+Without the alerts, the operator runbook in §6.3 ("notice via console or alert") is fiction. Alerts are required for §6.3 to function, so they ship together with the queue.
 
 ### 5.5 `scripts/cutover-tenant-to-tasks.js` — per-tenant cutover
 
@@ -137,13 +147,16 @@ The DLQ is a separate Cloud Tasks queue. Tasks are routed there automatically wh
 
 **Responsibility:** call Gemini Flash for the first extraction pass; if Flash returns low confidence or specific failure shapes, escalate the same payload to Gemini Pro.
 
-**Surface area:** modifies the existing `extractInvoiceWithGemini` function to consult two env vars already wired through `config`:
-- `GEMINI_MODEL` → primary model, defaulted to `gemini-2.5-flash` (was Pro)
-- `GEMINI_FALLBACK_MODEL` → escalation model, defaulted to `gemini-3-pro-preview`
+**Surface area:** modifies the existing `extractInvoiceWithGemini` function only. Other Gemini callers (`assignAccountsWithGemini`, `researchVendorWithGemini`) are deliberately untouched — they keep using `geminiWithRetryAndFallback` with Pro as primary so account-assignment accuracy isn't disturbed by Flash routing.
+
+To keep the blast radius contained, three **new** config keys are added under `config.gemini` rather than repurposing the existing `GEMINI_MODEL`/`GEMINI_FALLBACK_MODEL` (which other callers depend on):
+- `GEMINI_EXTRACTION_PRIMARY` → primary extraction model, default `gemini-2.5-flash`
+- `GEMINI_EXTRACTION_FALLBACK` → escalation model, default `gemini-3-pro-preview`
+- `GEMINI_ESCALATE_CONFIDENCE_THRESHOLD` → numeric threshold, default `0.7`
 
 **Escalation triggers (any one):**
 1. Flash response missing required schema fields (e.g., `vendor.name` empty, `invoice.grand_total` empty)
-2. Any field's `confidence` < `ESCALATE_CONFIDENCE_THRESHOLD` (default 0.7)
+2. Any field's `confidence` < `GEMINI_ESCALATE_CONFIDENCE_THRESHOLD` (default 0.7)
 3. Flash returned a 4xx/5xx error other than 429 (treat as model-incompatible, not transient)
 
 **On 429 from Flash:** do NOT escalate to Pro (that just shifts pressure between quotas). Instead, throw a quota error so `taskHandler.classifyError` returns 429 → Cloud Tasks retries with backoff.
@@ -153,6 +166,33 @@ The DLQ is a separate Cloud Tasks queue. Tasks are routed there automatically wh
 **Configuration:** all thresholds and model names go through `config.js`, no hardcoded values. Each tenant uses the same defaults; per-tenant overrides are out of scope for v1.
 
 **Why this is in scope despite being orthogonal to the queue:** it's the *quota* answer to the same problem the queue addresses (handling load). Building the queue without Flash routing leaves Gemini Pro RPM as the silent ceiling under sustained load. With Flash-first, the queue's `max_concurrent_dispatches=30` doesn't bump into Gemini quota until ~5x the current ceiling.
+
+### 5.7 `src/slugResolver.js` — extract slug-to-target-key resolution (Phase 1 prerequisite)
+
+**Responsibility:** map a tenant slug (path param like `proseso-accounting-test`) to the worker's internal `target_key` plus the OdooClient + companyId needed to call `runOne`.
+
+**Why this is its own component:** today, slug resolution is inlined inside the `authRecord` middleware in `src/webhookRoutes.js` — it isn't an importable function. Both the existing `/webhook/document-upload/:slug` and the new `/task/run-one/:slug` need this resolution, so we extract it once and reuse rather than duplicating logic.
+
+**Interface:**
+
+```js
+async function resolveSlugToTargetKey(slug, opts = {}): Promise<{
+  targetKey: string,
+  odoo: OdooClient,
+  companyId: number,
+  target: TargetConfig,  // the full target record
+}>
+```
+
+**Dependencies:** existing `getTargetsFromOdoo` / `OdooClient` / target cache. No new external deps.
+
+**Migration path (lands BEFORE `taskHandler` in Phase 1):**
+1. Move the slug-resolution logic out of `authRecord` middleware into `src/slugResolver.js`
+2. Have `authRecord` call `resolveSlugToTargetKey` internally
+3. Verify existing `/webhook/document-upload/:slug` behavior is unchanged (existing tests + smoke probe)
+4. Only after that does `taskHandler` (§5.2) consume the same resolver
+
+This is a refactor with zero behavior change — it just creates the seam needed for §5.2 to reuse the routing logic.
 
 ## 6. Error handling & observability
 
@@ -185,7 +225,12 @@ Regex specificity matters — false positives in either direction lose docs or b
 | 429 response rate | Cloud Run logs filtered by `httpRequest.status=429` | Gemini quota pressure |
 | Per-tenant in-flight | Worker `/debug` endpoint (extends existing) | One tenant monopolizing |
 
-**Day-one alert:** Cloud Monitoring alert on `oldest_task_age > 3600s` → email operator. That's the single signal that says "ingestion is broken".
+**Three Cloud Monitoring alerts ship with the queue (defined in §5.4 `cloud_tasks_alerts.tf`):**
+1. `oldest_task_age > 3600s` on the main queue — primary "ingestion is broken" signal
+2. `dlq_depth > 5` on the dead-letter queue — surfaces operator-attention items
+3. `queue_depth > 50 for 30min` on the main queue — early warning that the queue is filling faster than it drains
+
+All three notify `joseph@proseso-consulting.com` via the `operator_email` notification channel.
 
 ### 6.3 DLQ workflow
 
@@ -240,11 +285,23 @@ Phasing = how we split the work into independently shippable PRs. After each pha
 
 **Phase 0 (PR #1) — Gemini Flash-first routing.** Modify `extractInvoiceWithGemini` (§5.6) to call Flash by default and escalate to Pro on low confidence. Self-contained; lands before queue work. Rollback is a one-line env-var change. Production effect: per-doc latency drops on simple bills (Flash is faster), Pro RPM pressure drops by ~5x on aggregate.
 
-**Phase 1 (PR #2) — Queue consumer endpoint, dormant.** Add `/task/run-one/:slug` endpoint with OIDC validation, `tenantSemaphore` module, `classifyError` helper, all unit tests. **No Cloud Tasks integration yet** — endpoint is callable but nothing produces tasks. Tested via `gcloud tasks create-http-task --queue=ap-worker-bills`. Production effect: zero (endpoint is dormant).
+**Phase 1 (PR #2) — Queue consumer endpoint, dormant.** Land in this order in a single PR:
+1. Extract `resolveSlugToTargetKey` (§5.7) from existing `authRecord` middleware. Refactor with no behavior change. Existing tests pass.
+2. Add `tenantSemaphore` module (§5.3) and `classifyError` helper (§6.1) with their unit tests.
+3. Add `/task/run-one/:slug` endpoint with OIDC validation. Endpoint consumes §5.7's resolver and §5.3's semaphore.
+4. Test the endpoint via `gcloud tasks create-http-task --queue=ap-worker-bills` (manually).
+
+**No Cloud Tasks integration yet** — endpoint is callable but nothing produces tasks. Production effect: zero (endpoint is dormant; the refactor in step 1 is behavior-preserving).
 
 **Phase 2 (PR #3) — Single-tenant cutover.** Add `/enqueue/:slug` proxy endpoint, Terraform for queue + DLQ + invoker SA, `cutover-tenant-to-tasks.js` script, integration test. Cut over **proseso-accounting-test only**. Other 30 tenants stay on `/webhook/document-upload/:slug`. Soak 24 hours. Rollback: `cutover-tenant-to-tasks.js --revert proseso-accounting-test`.
 
-**Phase 3 (PR #4) — Wide cutover.** After 24-hour soak with no anomalies, run the cutover script for all remaining 30+ tenants. Monitor queue depth and DLQ for 1 week. After clean operation, document the architecture in CLAUDE.md and remove this spec's "draft" status.
+**Phase 3 — Batched wide cutover** (no PR; executed via `cutover-tenant-to-tasks.js` runs). Done in three batches with soak between each so any tenant-data-shape bug surfaces on a bounded blast radius rather than across all 30+ at once:
+
+- **3a:** 10 tenants (mix of single-company and multi-company PH clients). Soak 4 hours, check queue depth + DLQ + escalation rate. If clean → 3b.
+- **3b:** Next 10 tenants. Same soak.
+- **3c:** Remaining tenants (including any non-PH if applicable). Same soak.
+
+If any batch surfaces a regression, the cutover script's `--revert` flag rolls that batch back per-tenant. Subsequent batches pause until the issue is understood. After all three batches are clean and 1 week of operation has passed, document the architecture in CLAUDE.md and remove this spec's "draft" status.
 
 **Phase 4 (deferred, separate spec) — Retire `/webhook/document-upload/:slug`.** After 30 days of clean operation. Not in this spec.
 
